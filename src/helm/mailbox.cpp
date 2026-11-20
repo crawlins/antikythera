@@ -31,6 +31,7 @@ constexpr std::size_t vm_status_body_len = 8;
 constexpr std::size_t attach_device_body_len = 32;
 constexpr std::size_t detach_device_body_len = 16;
 constexpr std::size_t create_volume_body_len = 20;
+constexpr std::size_t create_image_volume_body_len = create_volume_body_len + 4 + image_name_size;
 constexpr std::size_t delete_volume_body_len = 8;
 constexpr std::size_t attach_volume_body_len = 20;
 constexpr std::size_t detach_volume_body_len = 24;
@@ -226,7 +227,11 @@ auto decode_detach_device(const Message& msg) noexcept -> std::expected<DetachDe
 }
 
 auto decode_create_volume(const Message& msg) noexcept -> std::expected<CreateVolume, BodyError> {
-    auto r = check_shape(msg, Type::create_volume, create_volume_body_len);
+    // Two shapes: a disk volume, or one with an image source.
+    const bool image = msg.header.type == Type::create_volume &&
+                       msg.header.body_len == create_image_volume_body_len;
+    auto r = check_shape(msg, Type::create_volume,
+                         image ? create_image_volume_body_len : create_volume_body_len);
     if (!r) {
         return std::unexpected(r.error());
     }
@@ -237,6 +242,15 @@ auto decode_create_volume(const Message& msg) noexcept -> std::expected<CreateVo
     if (out.volume_id == 0 || out.owner_vm == 0 || out.size_gib == 0 ||
         out.size_gib > max_volume_gib) {
         return invalid();
+    }
+    if (image) {
+        out.image_store = *r->le16();
+        const auto rsvd = *r->le16();
+        const auto name = *r->bytes(image_name_size);
+        std::ranges::copy(name, out.image_name.begin());
+        if (out.image_store == 0 || rsvd != 0 || all_zero(out.image_name)) {
+            return invalid();
+        }
     }
     return out;
 }
@@ -699,6 +713,11 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
                        w.le64(b.volume_id);
                        w.le64(b.owner_vm);
                        w.le32(b.size_gib);
+                       if (b.image_store != 0) {
+                           w.le16(b.image_store);
+                           w.le16(0);
+                           w.bytes(b.image_name);
+                       }
                    },
                    [&](const DeleteVolume& b) { w.le64(b.volume_id); },
                    [&](const AttachVolume& b) {

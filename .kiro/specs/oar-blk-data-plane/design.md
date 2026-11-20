@@ -275,10 +275,29 @@ On the storage role (task 13, role side):
 - **Rewrap.** `rewrap_volume` of an image volume fails: there is no key to
   rewrap until task 15.
 
-helm's half (task 13, helm side) is still open. It covers CREATE_VOLUME
-with an image source on the mailbox, no volume key for image volumes,
-K_eph drawn and delivered at ATTACH_VOLUME, and ownership kept without a
-KeyStore entry.
+On the helm side:
+
+- **Mailbox.** CREATE_VOLUME has a second, 56-byte shape: the 20-byte
+  disk body, then `image_store u16 | reserved u16 | image_name[32]`.
+  The long shape requires a non-zero store, zero reserved bytes and a
+  name that is not all zero; a peer that only knows the 20-byte body
+  refuses it as the wrong length, so an image volume never turns into an
+  empty disk by accident.
+- **No volume key.** helm creates no KeyStore entry for an image volume.
+  The router keeps its owner itself, marked as an image volume, and
+  still requires the owner VM to exist. The relay to the role carries
+  the store and name and no wrapped key.
+- **K_eph.** At each ATTACH_VOLUME commit helm draws a fresh 64-byte key
+  (`KeyStore::create_ephemeral_key`, from the secure element's random
+  source; never wrapped or kept) and delivers it as it would an
+  unwrapped volume key. Detach and cleaning drop it, which discards the
+  overlay; the next attachment sees the image as published.
+- **Lifecycle.** DELETE_VOLUME of an image volume destroys no key.
+  REWRAP_VOLUME answers `unsupported` until task 15. DESTROY_VM deletes
+  the VM's image volumes unless asked to persist them: there is nothing
+  in them worth keeping, but a persisted one can be attached again.
+- **Test controller.** `create-volume VOLUME OWNER_VM SIZE_GIB [STORE
+  IMAGE_NAME]` sends the long shape, the name in hex.
 
 Open: how a storage board reaches the object store (through an oar-net
 function, or its own uplink); on harbor the oar-blk process uses L1's
@@ -292,10 +311,10 @@ CommandRouter, for the full rules):
 
 | Command | Before relay (undone on failure) | After hull's ok |
 |---|---|---|
-| CREATE_VOLUME | create the key; `create_volume` with the wrapped key on the lowest blk slot | — |
-| ATTACH_VOLUME | reserve the function (on the volume's slot); `prepare_function` | unwrap, `deliver_key` |
+| CREATE_VOLUME | create the key (none for an image volume); `create_volume` with the wrapped key (or the image source) on the lowest blk slot | — |
+| ATTACH_VOLUME | reserve the function (on the volume's slot); `prepare_function` | unwrap (or draw K_eph), `deliver_key` |
 | DETACH_VOLUME | — | release; cleaning drops the key and closes the volume |
-| DELETE_VOLUME | — | destroy the key (crypto-erase), `delete_volume` |
+| DELETE_VOLUME | — | destroy the key (crypto-erase; none for an image volume), `delete_volume` |
 | REWRAP_VOLUME | — | rewrap in the KeyStore, `rewrap_volume` |
 
 The key follows hull's ok because hull answers once the VMM has opened the

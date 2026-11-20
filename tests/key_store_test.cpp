@@ -357,6 +357,19 @@ BOOST_AUTO_TEST_CASE(unwrap_is_stable_and_keys_distinct,
     BOOST_TEST(f.store.volumes_of(vm_one) == (std::vector<VolumeId>{vol_a, vol_b}));
 }
 
+// An image volume's per-attachment key: full size, fresh each time, and
+// not kept anywhere.
+BOOST_AUTO_TEST_CASE(ephemeral_keys_are_fresh, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Fixture f;
+    auto a = f.store.create_ephemeral_key();
+    auto b = f.store.create_ephemeral_key();
+    BOOST_REQUIRE(a.has_value());
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(key_of(*a).size() == ak::helm::volume_key_size);
+    BOOST_TEST((key_of(*a) != key_of(*b)));
+    BOOST_TEST(f.store.volumes_of(vm_one).empty());
+}
+
 BOOST_AUTO_TEST_CASE(only_owner_unwraps, *boost::unit_test::timeout(unit_timeout_seconds)) {
     Fixture f;
     BOOST_REQUIRE(f.store.create_volume_key(vol_a, vm_one).has_value());

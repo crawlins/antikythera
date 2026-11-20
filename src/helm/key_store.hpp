@@ -59,6 +59,9 @@ public:
     auto unwrap_volume_key(VolumeId volume, VmId requester) -> std::expected<ScopedKey, KeyError>;
     auto rewrap(VolumeId volume, VmId new_owner) -> std::expected<void, KeyError>;
     auto destroy_volume_key(VolumeId volume) -> std::expected<void, KeyError>;
+    // A fresh key for one attachment of an image volume, never wrapped or
+    // kept (SecureElement::create_ephemeral_key).
+    auto create_ephemeral_key() -> std::expected<ScopedKey, KeyError>;
 
     // Reload persisted wrapped keys. A volume key's owner must already be
     // known.

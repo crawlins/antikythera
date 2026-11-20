@@ -184,6 +184,15 @@ BOOST_AUTO_TEST_CASE(commands_parse_to_their_bodies) {
                             std::byte{0x10}}}}));
     BOOST_TEST((body_of("destroy-vm 7 persist") ==
                 mb::Body{mb::DestroyVm{.vm_id = 7, .persist_volumes = true}}));
+    {
+        mb::CreateVolume image{.volume_id = 9, .owner_vm = 7, .size_gib = 4, .image_store = 3};
+        for (std::size_t i = 0; i < image.image_name.size(); ++i) {
+            image.image_name[i] = static_cast<std::byte>(0xA0 + i);
+        }
+        BOOST_TEST((body_of("create-volume 9 7 4 3 "
+                            "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf") ==
+                    mb::Body{image}));
+    }
     BOOST_TEST((body_of("attach-volume 9 7 2 1") ==
                 mb::Body{mb::AttachVolume{
                     .volume_id = 9,
@@ -247,6 +256,12 @@ BOOST_AUTO_TEST_CASE(mistakes_are_named) {
     BOOST_TEST(parse_error("attach-device 7 3 gpu 0 0x55 0x10 02:00:00:00:00:10")
                    .find("invalid command") != std::string::npos);
     BOOST_TEST(parse_error("destroy-vm 7 keep").find("persist") != std::string::npos);
+    BOOST_TEST(parse_error("create-volume 9 7 4 3").find("wrong number") != std::string::npos);
+    BOOST_TEST(parse_error("create-volume 9 7 4 3 a0a1").find("image name") != std::string::npos);
+    // An image store with an all-zero name is refused before it is sent.
+    BOOST_TEST(
+        parse_error("create-volume 9 7 4 3 " + std::string(64, '0')).find("invalid command") !=
+        std::string::npos);
     BOOST_TEST(parse_error("expect fine").find("unknown status") != std::string::npos);
     BOOST_TEST(parse_error("wait forever").find("unknown report kind") != std::string::npos);
     BOOST_TEST(parse_error("map-update 5").find("map-update") != std::string::npos);

@@ -7,9 +7,11 @@
 #define BOOST_TEST_MODULE mailbox_bodies_test
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -68,6 +70,10 @@ constexpr std::size_t attach_mac = 24;
 constexpr std::size_t attach_rsvd = 30;
 constexpr std::byte multicast_mac{0x03};  // locally administered but multicast
 constexpr std::byte vendor_mac{0x00};     // unicast but universally administered
+constexpr std::uint16_t image_store = 3;
+constexpr std::size_t image_store_offset = 20;  // in an image CREATE_VOLUME
+constexpr std::size_t image_name_offset = 24;
+constexpr std::size_t image_volume_body_len = 56;
 
 auto sig() -> std::array<std::byte, mb::signature_size> {
     return {};
@@ -110,6 +116,17 @@ auto nic_attach() -> mb::AttachDevice {
     return {.vm_id = vm_a, .device = nic, .vni = vni, .nic_id = nic_id, .mac = guest_mac};
 }
 
+auto image_volume() -> mb::CreateVolume {
+    mb::ImageName name{};
+    name.fill(std::byte{0x5A});
+    name[0] = std::byte{0x01};
+    return {.volume_id = volume,
+            .owner_vm = vm_a,
+            .size_gib = volume_gib,
+            .image_store = image_store,
+            .image_name = name};
+}
+
 auto ok_response() -> mb::Response {
     mb::Response r;
     r.in_reply_to = sample_seq;
@@ -143,6 +160,7 @@ auto every_body() -> std::vector<mb::Body> {
                          .policy = mb::DetachPolicy::destroy_vm},
         mb::CreateVolume{.volume_id = volume, .owner_vm = vm_a, .size_gib = volume_gib},
         mb::CreateVolume{.volume_id = volume, .owner_vm = vm_a, .size_gib = mb::max_volume_gib},
+        image_volume(),
         mb::DeleteVolume{.volume_id = volume},
         mb::AttachVolume{.volume_id = volume, .vm_id = vm_a, .device = blk},
         mb::DetachVolume{.volume_id = volume,
@@ -303,6 +321,34 @@ BOOST_AUTO_TEST_CASE(field_ranges_are_enforced, *boost::unit_test::timeout(unit_
                              .vm_id = vm_a,
                              .device = blk,
                              .timeout_s = mb::max_detach_timeout_s + 1});
+}
+
+// An image volume (oar-blk Requirement 8) is the 20-byte disk body plus
+// its image source; the extra fields are checked like any other.
+BOOST_AUTO_TEST_CASE(image_volume_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto bytes = mb::encode_body(image_volume());
+    BOOST_REQUIRE(bytes.size() == image_volume_body_len);
+    const auto plain = mb::encode_body(
+        mb::CreateVolume{.volume_id = volume, .owner_vm = vm_a, .size_gib = volume_gib});
+    BOOST_TEST(std::ranges::equal(std::span(bytes).first(plain.size()), plain));
+    BOOST_TEST((bytes[image_store_offset] == std::byte{image_store}));
+    BOOST_TEST((bytes[image_store_offset + 1] == zero));
+    BOOST_TEST((bytes[image_store_offset + 2] == zero));
+    BOOST_TEST((bytes[image_store_offset + 3] == zero));
+    BOOST_TEST((bytes[image_name_offset] == std::byte{0x01}));
+    BOOST_TEST((bytes[image_name_offset + 1] == std::byte{0x5A}));
+
+    expect_invalid(image_volume(), image_store_offset, zero);  // store 0 in the long shape
+    expect_invalid(image_volume(), image_store_offset + 2, nonzero);
+    expect_invalid(image_volume(), image_store_offset + 3, nonzero);
+    auto no_name = bytes;
+    std::fill(no_name.begin() + image_name_offset, no_name.end(), zero);
+    BOOST_TEST((decode_error(mb::Type::create_volume, no_name) == BodyError::invalid_field));
+    // The disk-volume range rules still apply to the long shape.
+    auto no_size = image_volume();
+    no_size.size_gib = 0;
+    BOOST_TEST((decode_error(mb::Type::create_volume, mb::encode_body(no_size)) ==
+                BodyError::invalid_field));
 }
 
 // Storage functions only move with their volume (and its key); GPU scrub

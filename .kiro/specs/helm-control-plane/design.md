@@ -134,14 +134,17 @@ Decisions made in the implementation:
 
 Wraps the secure element. API: `create_vm_key`, `destroy_vm_key`,
 `create_volume_key(vm)`, `unwrap_volume_key(vol) → ScopedKey`,
-`rewrap(vol, new_vm)`, `destroy_volume_key`. `ScopedKey` is a move-only
+`rewrap(vol, new_vm)`, `destroy_volume_key`, and
+`create_ephemeral_key() → ScopedKey` (a fresh key for one attachment of
+an image volume, never wrapped or kept; oar-blk-data-plane design).
+`ScopedKey` is a move-only
 type whose destructor zeroizes (`OPENSSL_cleanse`) and which can only be
 consumed by `OarLink::deliver_key`. In harbor the secure element is a
 file-backed software implementation behind the same interface.
 
 The secure element interface takes and returns only wrapped keys, so a
 plaintext VM key never leaves it; the only plaintext out is a volume key
-as a `ScopedKey`. Wrapping is AES-256-GCM with a random 96-bit nonce,
+(or an ephemeral key) as a `ScopedKey`. Wrapping is AES-256-GCM with a random 96-bit nonce,
 and the AAD binds the blob's header and identity (`vm_id` for a VM key,
 `volume_id` and owner `vm_id` for a volume key): a wrapped volume key
 copied to another volume, or presented as another VM's, fails

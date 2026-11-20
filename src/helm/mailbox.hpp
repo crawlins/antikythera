@@ -273,10 +273,22 @@ struct DetachDevice {
 
 // CREATE_VOLUME: volume_id u64 | owner_vm u64 | size_gib u32  (20 bytes)
 // 1 <= size_gib <= 65536.
+// An image volume (oar-blk Requirement 8) adds its image source:
+//   ... | image_store u16 | reserved u16 | image_name [32]  (56 bytes)
+// image_store (non-zero) names an object store the storage role is
+// configured with; image_name is the image's name, the SHA-256 of its
+// manifest (never all zero). The volume is that image under a throwaway
+// overlay: helm creates no volume key for it, and draws a fresh ephemeral
+// key at each ATTACH_VOLUME instead.
+inline constexpr std::size_t image_name_size = 32;
+using ImageName = std::array<std::byte, image_name_size>;
+
 struct CreateVolume {
     std::uint64_t volume_id{0};
     std::uint64_t owner_vm{0};
     std::uint32_t size_gib{0};
+    std::uint16_t image_store{0};  // non-zero: an image volume
+    ImageName image_name{};        // set exactly when image_store is
     friend auto operator==(const CreateVolume&, const CreateVolume&) -> bool = default;
 };
 
