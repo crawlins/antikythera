@@ -159,6 +159,22 @@ auto SplitQueue::pop() -> std::expected<std::optional<Chain>, QueueError> {
     return std::optional<Chain>{std::move(*chain)};
 }
 
+auto SplitQueue::rewalk(std::uint16_t head) -> std::expected<Chain, QueueError> {
+    if (_broken) {
+        return std::unexpected(QueueError::broken);
+    }
+    if (head >= _config.size || !_in_flight[head]) {
+        return std::unexpected(QueueError::unknown_head);
+    }
+    auto chain = walk(head);
+    if (!chain) {
+        return fail(chain.error());
+    }
+    // push() may fill what the chain holds now.
+    _capacity[head] = chain->writable_bytes;
+    return chain;
+}
+
 auto SplitQueue::add_buffer(Chain& chain, const Descriptor& d, bool& seen_writable)
     -> std::expected<void, QueueError> {
     if ((d.flags & desc_f_write) != 0) {

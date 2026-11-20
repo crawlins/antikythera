@@ -72,6 +72,10 @@ auto BlkRole::create(RoleConfig config, const std::vector<FunctionTransport*>& t
     }
     std::unique_ptr<BlkRole> role{new BlkRole{std::move(config)}};
     role->_started = role->_config.clock();
+    role->_waker = Waker::create();
+    if (!role->_waker) {
+        return std::unexpected("cannot create the waker eventfd");
+    }
     role->_slots.resize(transports.size());
     for (std::size_t i = 0; i < transports.size(); ++i) {
         Slot& s = role->_slots[i];
@@ -193,7 +197,8 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
          .capacity_bytes = m.capacity_sectors * sector_size,
          .logical_block_size = m.logical_block_size,
          .overlay_limit_bytes = _config.overlay_limit_bytes,
-         .max_readahead_chunks = _config.max_readahead_chunks});
+         .max_readahead_chunks = _config.max_readahead_chunks,
+         .waker = _waker});
     if (!backend) {
         return std::unexpected(std::format("image {}: {}", hex, to_string(backend.error())));
     }
@@ -335,6 +340,8 @@ auto BlkRole::health() -> std::expected<oar::Health, oar::Status> {
 }
 
 auto BlkRole::poll() -> bool {
+    // Before looking at what arrived, so a later arrival rearms it.
+    _waker->drain();
     bool more = false;
     for (auto& s : _slots) {
         if (s.active) {

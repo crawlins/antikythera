@@ -601,7 +601,8 @@ auto boot_image(blk::ObjectStore& store, const blk::ImageDigest& name, const std
                                                       .overlay_dir = dir,
                                                       .capacity_bytes = manifest->image_bytes,
                                                       .logical_block_size = 512,
-                                                      .max_readahead_chunks = 2});
+                                                      .max_readahead_chunks = 2,
+                                                      .waker = nullptr});
         BOOST_REQUIRE(backend.has_value());
         std::array<std::byte, blk::xts_key_size> key{};
         for (std::size_t i = 0; i < key.size(); ++i) {

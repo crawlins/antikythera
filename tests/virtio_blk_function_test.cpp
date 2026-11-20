@@ -135,8 +135,15 @@ public:
         return {};
     }
 
+    [[nodiscard]] auto read_ready(std::uint64_t /*offset*/, std::size_t /*len*/) -> bool override {
+        ++ready_asks;
+        return ready;
+    }
+
     std::vector<std::byte> data;
     bool fail{false};
+    bool ready{true};  // read_ready()'s answer
+    unsigned ready_asks{0};
     unsigned reads{0};
     unsigned writes{0};
     unsigned flushes{0};
@@ -272,6 +279,11 @@ public:
         return request(static_cast<std::uint32_t>(RequestType::in), sector, {}, len, q);
     }
 
+    // Where request `id`'s status byte is, for checks that do not assume
+    // in-order completion.
+    [[nodiscard]] auto status_gpa(std::size_t id) const -> vio::Gpa {
+        return _pending.at(id).status_gpa;
+    }
     [[nodiscard]] auto fn() -> blk::VirtioBlkFunction& { return *_fn; }
     [[nodiscard]] auto backend() -> MemoryBackend& { return *_backend; }
     [[nodiscard]] auto driver() -> VirtioDriver& { return *_driver; }
@@ -764,6 +776,78 @@ BOOST_AUTO_TEST_CASE(drop_key_ends_the_wait, *boost::unit_test::timeout(unit_tim
     rig.fn().await_key();
     BOOST_TEST(!rig.fn().awaiting_key());
     BOOST_TEST(rig.write(0, pattern(0, blk::sector_size)).status == ok());
+}
+
+// A read the backend cannot serve without waiting (an image miss) is parked:
+// the rest of the ring goes on, and poll() serves it once the backend is
+// ready (oar-blk Requirement 8.10).
+BOOST_AUTO_TEST_CASE(unready_reads_are_parked, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig;
+    rig.deliver_key();
+    const auto plain = pattern(8, blk::sector_size);
+    BOOST_REQUIRE(rig.write(8, plain).status == ok());
+
+    rig.backend().ready = false;
+    const auto r = rig.post(static_cast<std::uint32_t>(RequestType::in), 8, {}, blk::sector_size);
+    rig.notify();
+    BOOST_TEST(rig.result(r).status == status_canary);  // parked, not failed
+    BOOST_TEST(rig.fn().counters().parked == 1U);
+    BOOST_TEST(rig.backend().reads == 0U);
+
+    // Writes, flushes and GET_ID behind it are served; they never wait.
+    const auto w = rig.post(static_cast<std::uint32_t>(RequestType::out), 20, plain);
+    const auto f = rig.post(static_cast<std::uint32_t>(RequestType::flush), 0);
+    rig.notify();
+    BOOST_TEST(rig.ram().get<std::byte>(rig.status_gpa(w)) == ok());
+    BOOST_TEST(rig.ram().get<std::byte>(rig.status_gpa(f)) == ok());
+    BOOST_TEST(rig.driver().used_idx(queue0) == 3U);
+
+    // Still not ready: poll() leaves it, and does not ask to be called again.
+    BOOST_TEST(!rig.fn().pci().poll());
+    BOOST_TEST(rig.result(r).status == status_canary);
+
+    rig.backend().ready = true;
+    static_cast<void>(rig.fn().pci().poll());
+    BOOST_TEST(rig.result(r).status == ok());
+    BOOST_TEST(rig.result(r).data == plain, boost::test_tools::per_element());
+    BOOST_TEST(rig.fn().counters().resumed == 1U);
+    BOOST_REQUIRE(rig.driver().used_idx(queue0) == 4U);
+    BOOST_TEST(rig.driver().used_len(queue0, 3) == blk::sector_size + blk::status_size);
+    // A resumed read is not asked about twice: it is served as it is now.
+    const unsigned asks = rig.backend().ready_asks;
+    static_cast<void>(rig.fn().pci().poll());
+    BOOST_TEST(rig.backend().ready_asks == asks);
+}
+
+BOOST_AUTO_TEST_CASE(parked_reads_go_with_the_queues_or_the_key,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig;
+    rig.deliver_key();
+    rig.backend().ready = false;
+    const auto lost =
+        rig.post(static_cast<std::uint32_t>(RequestType::in), 0, {}, blk::sector_size);
+    rig.notify();
+    BOOST_TEST(rig.fn().counters().parked == 1U);
+
+    // An FLR drops the rings, and the parked head with them.
+    rig.fn().function_reset();
+    rig.backend().ready = true;
+    BOOST_REQUIRE(rig.up());
+    rig.deliver_key();
+    static_cast<void>(rig.fn().pci().poll());
+    BOOST_TEST(rig.result(lost).status == status_canary);
+    BOOST_TEST(rig.fn().counters().resumed == 0U);
+
+    // A parked read whose key goes before it is served fails.
+    rig.backend().ready = false;
+    const auto r = rig.post(static_cast<std::uint32_t>(RequestType::in), 0, {}, blk::sector_size);
+    rig.notify();
+    BOOST_TEST(rig.result(r).status == status_canary);
+    rig.fn().drop_key();
+    rig.backend().ready = true;
+    static_cast<void>(rig.fn().pci().poll());
+    BOOST_TEST(rig.result(r).status == ioerr());
+    BOOST_TEST(rig.backend().reads == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(missing_status_byte_needs_reset,

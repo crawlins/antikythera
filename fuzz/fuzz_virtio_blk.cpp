@@ -6,7 +6,9 @@
 // script of BAR accesses, kicks, polls, key deliveries and resets. Checks
 // that every backend access is a whole number of logical blocks inside the
 // volume (Requirement 6.1), and that an FLR always leaves the function
-// without a key (Requirements 1.2, 2.3).
+// without a key (Requirements 1.2, 2.3). The backend's read_ready() answer
+// is part of the script, so reads are parked and resumed (re-walking chains
+// the guest may have changed meanwhile) at arbitrary points.
 
 #include <algorithm>
 #include <array>
@@ -15,6 +17,7 @@
 #include <cstdlib>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "oar/blk/virtio_blk_function.hpp"
@@ -72,6 +75,10 @@ public:
         std::copy_n(_data.begin() + static_cast<std::ptrdiff_t>(offset), out.size(), out.begin());
         return {};
     }
+    [[nodiscard]] auto read_ready(std::uint64_t offset, std::size_t len) -> bool override {
+        check(offset, len);
+        return ready;
+    }
     [[nodiscard]] auto write(std::uint64_t offset, std::span<const std::byte> in)
         -> std::expected<void, blk::BackendError> override {
         check(offset, in.size());
@@ -79,6 +86,8 @@ public:
         return {};
     }
     [[nodiscard]] auto flush() -> std::expected<void, blk::BackendError> override { return {}; }
+
+    bool ready{true};
 
 private:
     auto check(std::uint64_t offset, std::size_t len) const -> void {
@@ -156,6 +165,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     NullInterrupts irq;
     const std::uint32_t block = (mode & mode_4k) != 0 ? block_4k : blk::sector_size;
+    auto owned = std::make_unique<CheckingBackend>(block);
+    CheckingBackend* backend = owned.get();
     auto fn =
         blk::VirtioBlkFunction::create({.geometry = {.capacity_sectors = capacity_sectors,
                                                      .logical_block_size = block,
@@ -166,7 +177,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                                         .queue_size = queue_size,
                                         .budget = 4,
                                         .serial = "fuzz"},
-                                       memory, irq, std::make_unique<CheckingBackend>(block));
+                                       memory, irq, std::move(owned));
     if (!fn) {
         std::abort();
     }
@@ -185,7 +196,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 
     std::array<std::byte, blk::xts_key_size> key{};
     for (std::size_t op = 0; op < max_ops && !in.empty(); ++op) {
-        switch (in.u8() % 10) {
+        switch (in.u8() % 11) {
             case 0:
                 static_cast<void>(pci.bar_write(virtio::bar_layout::notify_offset, width16, 0));
                 break;
@@ -241,6 +252,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                 } else {
                     pci.memory_changing(ram_base + in.u16(), in.u16());
                 }
+                break;
+            case 9:
+                backend->ready = !backend->ready;  // a miss starts, or its chunk arrives
                 break;
             default: {
                 // The guest rewrites a byte of its own RAM mid-run.

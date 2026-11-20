@@ -10,6 +10,7 @@
 #define BOOST_TEST_MODULE blk_role_test
 #include <boost/test/unit_test.hpp>
 
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -86,6 +87,8 @@ constexpr std::size_t wrapped_size = 95;
 constexpr std::uint64_t marker_sector = 12;
 constexpr std::uint64_t far_sector = 200;
 constexpr auto serve_poll = std::chrono::milliseconds{5};
+constexpr auto settle_deadline = std::chrono::seconds{5};
+constexpr int wake_wait_ms = 50;
 constexpr auto link_timeout = std::chrono::seconds{5};
 constexpr ak::helm::LinkAddress helm_side{
     .local_addr = 0x08, .peer_addr = 0x12, .local_eid = 8, .peer_eid = 18};
@@ -171,7 +174,22 @@ private:
 // A guest driver for whatever function a transport serves right now.
 class Guest {
 public:
-    Guest(GuestRam& ram, vio::PciFunction& fn) : _ram{&ram}, _driver{ram, fn} {}
+    // With a role, a request that does not complete at once (a read parked
+    // on an image miss) is waited for the way ak-oar-blk's loop does: poll
+    // the role's waker, then BlkRole::poll().
+    Guest(GuestRam& ram, vio::PciFunction& fn, blk::BlkRole* role = nullptr)
+        : _ram{&ram}, _driver{ram, fn}, _role{role} {}
+
+    // Waits (with a role) until request `id` completes; false at the deadline.
+    auto settle(std::size_t id) -> bool {
+        const auto deadline = std::chrono::steady_clock::now() + settle_deadline;
+        while (!completed(id) && _role != nullptr && std::chrono::steady_clock::now() < deadline) {
+            pollfd p{.fd = _role->wake_fd(), .events = POLLIN, .revents = 0};
+            static_cast<void>(::poll(&p, 1, wake_wait_ms));
+            static_cast<void>(_role->poll());
+        }
+        return completed(id);
+    }
 
     auto up() -> bool {
         namespace cc = vio::common_cfg;
@@ -216,8 +234,10 @@ public:
         return _requests.size() - 1;
     }
 
+    // By its status byte: requests may complete out of order (a parked
+    // read finishes after requests posted behind it).
     [[nodiscard]] auto completed(std::size_t id) const -> bool {
-        return id < _driver.used_idx(queue0);
+        return _ram->get<std::byte>(_requests.at(id).status) != status_canary;
     }
     [[nodiscard]] auto status(std::size_t id) const -> Status {
         return static_cast<Status>(_ram->get<std::byte>(_requests.at(id).status));
@@ -231,7 +251,7 @@ public:
     }
     auto read(std::uint64_t sector) -> std::vector<std::byte> {
         const auto id = post(RequestType::in, sector, {}, blk::sector_size);
-        BOOST_REQUIRE(completed(id));
+        BOOST_REQUIRE(settle(id));
         BOOST_REQUIRE(status(id) == Status::ok);
         return data(id);
     }
@@ -256,6 +276,7 @@ private:
     };
     GuestRam* _ram;
     VirtioDriver _driver;
+    blk::BlkRole* _role;
     std::vector<Request> _requests;
 };
 
@@ -712,8 +733,20 @@ BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
     rig.t0.flr();  // the VMM opens the function
     BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
 
-    Guest g{rig.ram0, *rig.t0.served()};
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
     BOOST_REQUIRE(g.up());
+    // A cold read parks rather than holding up the ring: a write behind it
+    // completes first, and the read when its chunk arrives.
+    const auto cold = g.post(RequestType::in, marker_sector, {}, blk::sector_size);
+    const std::vector<std::byte> early(blk::sector_size, std::byte{0xDD});
+    const auto behind = g.post(RequestType::out, far_sector + 1, early);
+    BOOST_TEST(!g.completed(cold));
+    BOOST_TEST(g.completed(behind));
+    BOOST_REQUIRE(g.settle(cold));
+    BOOST_TEST((g.status(cold) == Status::ok));
+    BOOST_TEST(g.data(cold) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(rig.role->function(fn0)->counters().parked == 1U);
+    BOOST_TEST(rig.role->function(fn0)->counters().resumed == 1U);
     BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
     BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
     BOOST_TEST(g.read(far_sector) == std::vector<std::byte>(blk::sector_size),
@@ -738,7 +771,7 @@ BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
     rig.t0.flr();
     BOOST_TEST(!rig.role->function(fn0)->holds_key());
     BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
-    Guest g2{rig.ram0, *rig.t0.served()};
+    Guest g2{rig.ram0, *rig.t0.served(), rig.role.get()};
     BOOST_REQUIRE(g2.up());
     BOOST_TEST(g2.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
     BOOST_TEST(g2.read(far_sector) == std::vector<std::byte>(blk::sector_size),
@@ -754,7 +787,7 @@ BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
     BOOST_TEST(!rig.role->attached(fn0).has_value());
     BOOST_REQUIRE(rig.prepare(fn1, vm_one, vol_one) == oar::Status::ok);
     BOOST_REQUIRE(rig.deliver(fn1, vol_one) == oar::Status::ok);
-    Guest g3{rig.ram1, *rig.t1.served()};
+    Guest g3{rig.ram1, *rig.t1.served(), rig.role.get()};
     BOOST_REQUIRE(g3.up());
     BOOST_TEST(g3.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
 }

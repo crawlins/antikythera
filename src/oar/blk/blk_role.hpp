@@ -64,6 +64,7 @@
 #include "oar/blk/fetcher.hpp"
 #include "oar/blk/file_backend.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
+#include "oar/blk/waker.hpp"
 #include "oar/blk/object_store.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 
@@ -149,9 +150,14 @@ public:
     auto delete_volume(const helm::oar::DeleteVolume& request) -> helm::oar::Status override;
     auto rewrap_volume(const helm::oar::RewrapVolume& request) -> helm::oar::Status override;
 
-    // Serves deferred requests on every attached function; true if any
+    // Serves deferred requests on every attached function, and reads
+    // parked on an image chunk that has arrived; true if any function
     // still has work (call again soon).
     auto poll() -> bool;
+    // Readable when a chunk a parked read waits for has arrived: the event
+    // loop polls it alongside the transports and calls poll() when it
+    // fires (poll() clears it).
+    [[nodiscard]] auto wake_fd() const noexcept -> int { return _waker->fd(); }
 
     [[nodiscard]] auto volume_path(std::uint64_t volume_id) const -> std::filesystem::path;
     [[nodiscard]] auto function_count() const noexcept -> std::size_t { return _slots.size(); }
@@ -182,6 +188,7 @@ private:
         -> std::expected<std::unique_ptr<LazyImageBackend>, std::string>;
 
     RoleConfig _config;
+    std::shared_ptr<Waker> _waker;  // shared with the image backends' fetch callbacks
     std::vector<Slot> _slots;
     RoleConfig::Clock::time_point _started;
 };

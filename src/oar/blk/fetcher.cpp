@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <random>
+#include <utility>
+#include <vector>
 
 namespace ak::oar::blk {
 
@@ -29,14 +31,22 @@ Fetcher::~Fetcher() {
     for (auto& t : _workers) {
         t.join();
     }
-    const std::scoped_lock lock{_mutex};
-    for (auto* q : {&_demand, &_prefetch}) {
-        for (const auto& job : *q) {
-            if (!job->started && !job->done) {
-                finish(job, std::unexpected(FetchError::shut_down));
+    std::vector<std::pair<std::shared_ptr<Job>, std::vector<FetchCallback>>> waiting;
+    {
+        const std::scoped_lock lock{_mutex};
+        for (auto* q : {&_demand, &_prefetch}) {
+            for (const auto& job : *q) {
+                if (!job->started && !job->done) {
+                    waiting.emplace_back(job, finish(job, std::unexpected(FetchError::shut_down)));
+                }
             }
+            q->clear();
         }
-        q->clear();
+    }
+    for (const auto& [job, callbacks] : waiting) {
+        for (const auto& done : callbacks) {
+            done(job->result);
+        }
     }
 }
 
@@ -49,26 +59,44 @@ auto Fetcher::fetch(const std::shared_ptr<CachedImage>& image, std::uint32_t chu
     if (_stopping) {
         return std::unexpected(FetchError::shut_down);
     }
-    std::shared_ptr<Job> job;
+    const auto job = demand(image, chunk);
+    _done.wait(lock, [&] { return job->done; });
+    return job->result;
+}
+
+auto Fetcher::fetch_async(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk,
+                          FetchCallback done) -> std::expected<void, FetchError> {
+    if (chunk >= image->manifest().chunk_count() || image->manifest().is_hole(chunk)) {
+        return std::unexpected(FetchError::not_found);
+    }
+    const std::scoped_lock lock{_mutex};
+    if (_stopping) {
+        return std::unexpected(FetchError::shut_down);
+    }
+    demand(image, chunk)->callbacks.push_back(std::move(done));
+    return {};
+}
+
+auto Fetcher::demand(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk)
+    -> std::shared_ptr<Job> {
     if (auto it = _jobs.find({image.get(), chunk}); it != _jobs.end()) {
-        job = it->second;
+        auto job = it->second;
         ++_counters.joined;
         if (!job->started && !job->demand) {
             job->demand = true;  // promote readahead; the prefetch entry is skipped later
             _demand.push_back(job);
             _work.notify_one();
         }
-    } else {
-        job = std::make_shared<Job>();
-        job->image = image;
-        job->chunk = chunk;
-        job->demand = true;
-        _jobs.emplace(Key{image.get(), chunk}, job);
-        _demand.push_back(job);
-        _work.notify_one();
+        return job;
     }
-    _done.wait(lock, [&] { return job->done; });
-    return job->result;
+    auto job = std::make_shared<Job>();
+    job->image = image;
+    job->chunk = chunk;
+    job->demand = true;
+    _jobs.emplace(Key{image.get(), chunk}, job);
+    _demand.push_back(job);
+    _work.notify_one();
+    return job;
 }
 
 auto Fetcher::prefetch(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk) -> void {
@@ -120,11 +148,19 @@ auto Fetcher::run() -> void {
         lock.unlock();
         auto result = download(*job);
         lock.lock();
-        finish(job, std::move(result));
+        auto callbacks = finish(job, std::move(result));
+        if (!callbacks.empty()) {
+            // job->result is final: done is set and nothing writes it again.
+            lock.unlock();
+            for (const auto& done : callbacks) {
+                done(job->result);
+            }
+            lock.lock();
+        }
     }
 }
 
-auto Fetcher::download(const Job& job) -> std::expected<ChunkBytes, FetchError> {
+auto Fetcher::download(const Job& job) -> FetchResult {
     const ImageManifest& m = job.image->manifest();
     const auto deadline = ObjectStore::Clock::now() + _config.deadline;
     thread_local std::minstd_rand jitter{std::random_device{}()};
@@ -165,8 +201,8 @@ auto Fetcher::download(const Job& job) -> std::expected<ChunkBytes, FetchError> 
     return std::unexpected(last);
 }
 
-auto Fetcher::finish(const std::shared_ptr<Job>& job, std::expected<ChunkBytes, FetchError> result)
-    -> void {
+auto Fetcher::finish(const std::shared_ptr<Job>& job, FetchResult result)
+    -> std::vector<FetchCallback> {
     if (result) {
         ++_counters.fetched;
         _counters.fetched_bytes += (*result)->size();
@@ -177,6 +213,7 @@ auto Fetcher::finish(const std::shared_ptr<Job>& job, std::expected<ChunkBytes, 
     job->done = true;
     _jobs.erase({job->image.get(), job->chunk});
     _done.notify_all();
+    return std::exchange(job->callbacks, {});
 }
 
 }  // namespace ak::oar::blk

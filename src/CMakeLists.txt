@@ -177,7 +177,8 @@ add_library(ak_oar_blk_image
   oar/blk/image_pack.cpp
   oar/blk/lazy_image_backend.cpp
   oar/blk/object_store.cpp
-  oar/blk/overlay.cpp)
+  oar/blk/overlay.cpp
+  oar/blk/waker.cpp)
 add_library(ak::oar_blk_image ALIAS ak_oar_blk_image)
 find_package(Threads REQUIRED)
 target_link_libraries(ak_oar_blk_image
