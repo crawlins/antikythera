@@ -195,6 +195,7 @@ install(TARGETS ak-image-pack RUNTIME DESTINATION bin)
 # with Signature V4 (oar-blk task 11).
 add_library(ak_oar_blk_s3
   oar/blk/http_response.cpp
+  oar/blk/image_store_config.cpp
   oar/blk/s3_object_store.cpp
   oar/blk/sigv4.cpp)
 add_library(ak::oar_blk_s3 ALIAS ak_oar_blk_s3)
@@ -208,7 +209,7 @@ target_link_libraries(ak_oar_blk_s3
 add_library(ak_oar_blk_role oar/blk/blk_role.cpp)
 add_library(ak::oar_blk_role ALIAS ak_oar_blk_role)
 target_link_libraries(ak_oar_blk_role
-  PUBLIC ak::oar_blk ak::helm
+  PUBLIC ak::oar_blk_image ak::helm
   PRIVATE ak::warnings ak::hardening)
 
 # vfio-user device servers, built against libvfio-user (the `vfio-user`
@@ -307,7 +308,7 @@ if(LIBVFIO_USER_FOUND)
 
   add_executable(ak-oar-blk oar/blk/oar_blk_main.cpp)
   target_link_libraries(ak-oar-blk
-    PRIVATE ak::vfu_virtio ak::oar_blk_role ak::warnings ak::hardening)
+    PRIVATE ak::vfu_virtio ak::oar_blk_role ak::oar_blk_s3 ak::warnings ak::hardening)
   install(TARGETS ak-oar-blk RUNTIME DESTINATION bin)
 elseif(_ak_vfio_user_required)
   message(FATAL_ERROR

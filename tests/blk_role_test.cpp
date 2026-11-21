@@ -10,6 +10,7 @@
 #define BOOST_TEST_MODULE blk_role_test
 #include <boost/test/unit_test.hpp>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +22,8 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -37,6 +40,8 @@
 #include "helm/sideband_binding.hpp"
 #include "oar/blk/blk_role.hpp"
 #include "oar/blk/file_backend.hpp"
+#include "oar/blk/image_manifest.hpp"
+#include "oar/blk/image_pack.hpp"
 #include "test_support.hpp"
 #include "virtio_driver_support.hpp"
 
@@ -254,26 +259,128 @@ private:
     std::vector<Request> _requests;
 };
 
-// A role over two fake transports and a fresh volume directory.
+// An object store in memory, for image volumes.
+class MemoryStore final : public blk::ObjectStore {
+public:
+    auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
+        const std::scoped_lock lock{_mutex};
+        _objects[key] = std::move(bytes);
+    }
+    auto get_range(std::string_view key, std::uint64_t offset, std::span<std::byte> out,
+                   Clock::time_point /*deadline*/)
+        -> std::expected<void, blk::FetchError> override {
+        const std::scoped_lock lock{_mutex};
+        const auto it = _objects.find(std::string{key});
+        if (it == _objects.end() || offset > it->second.size() ||
+            out.size() > it->second.size() - offset) {
+            return std::unexpected(blk::FetchError::not_found);
+        }
+        std::copy_n(it->second.begin() + static_cast<std::ptrdiff_t>(offset), out.size(),
+                    out.begin());
+        return {};
+    }
+    auto get(std::string_view key, std::size_t max_bytes, Clock::time_point /*deadline*/)
+        -> std::expected<std::vector<std::byte>, blk::FetchError> override {
+        const std::scoped_lock lock{_mutex};
+        const auto it = _objects.find(std::string{key});
+        if (it == _objects.end()) {
+            return std::unexpected(blk::FetchError::not_found);
+        }
+        if (it->second.size() > max_bytes) {
+            return std::unexpected(blk::FetchError::too_large);
+        }
+        return it->second;
+    }
+
+private:
+    std::mutex _mutex;
+    std::map<std::string, std::vector<std::byte>> _objects;
+};
+
+constexpr std::uint16_t image_store_id = 4;
+constexpr std::string_view image_prefix = "images";
+
+// A role over two fake transports and a fresh volume directory; with
+// `images`, also an image store (in memory) and a chunk cache.
 struct Rig {
     TempDir dir;
     GuestRam ram0;
     GuestRam ram1;
     FakeTransport t0{ram0};
     FakeTransport t1{ram1};
+    MemoryStore store;
+    std::unique_ptr<blk::ChunkCache> cache;
+    std::unique_ptr<blk::Fetcher> fetcher;
     std::unique_ptr<blk::BlkRole> role;
 
-    Rig() {
+    explicit Rig(bool images = false) {
+        std::map<std::uint16_t, blk::ImageStore> stores;
+        if (images) {
+            auto c = blk::ChunkCache::create(dir.path, std::uint64_t{16} << 20U);
+            BOOST_REQUIRE(c.has_value());
+            cache = std::move(*c);
+            fetcher = blk::Fetcher::create(store, {.workers = 2,
+                                                   .deadline = std::chrono::milliseconds{2000},
+                                                   .attempts = 2,
+                                                   .backoff = std::chrono::milliseconds{1},
+                                                   .max_queued_prefetch = 8});
+            stores[image_store_id] = {
+                .store = &store, .fetcher = fetcher.get(), .prefix = std::string{image_prefix}};
+        }
         auto r = blk::BlkRole::create({.volume_dir = dir.path,
                                        .num_queues = 1,
                                        .queue_size = ak::test::test_queue_size,
                                        .seg_max = test_seg_max,
                                        .max_transfer_bytes = test_max_transfer,
                                        .budget = ak::test::test_queue_size,
+                                       .image_stores = std::move(stores),
+                                       .image_cache = cache.get(),
+                                       .overlay_dir = {},
+                                       .overlay_limit_bytes = 0,
+                                       .max_readahead_chunks = 8,
+                                       .manifest_deadline = std::chrono::milliseconds{1000},
                                        .clock = {}},
                                       {&t0, &t1});
         BOOST_REQUIRE(r);
         role = std::move(*r);
+    }
+
+    // Packs `raw` and publishes it to the store; the image name.
+    auto publish(const std::vector<std::byte>& raw,
+                 std::optional<blk::XtsKey> image_key = std::nullopt) -> oar::ImageName {
+        const int in = ::memfd_create("image", MFD_CLOEXEC);
+        const int data = ::memfd_create("data", MFD_CLOEXEC);
+        BOOST_REQUIRE(in >= 0 && data >= 0);
+        BOOST_REQUIRE(::write(in, raw.data(), raw.size()) == static_cast<ssize_t>(raw.size()));
+        blk::PackOptions o{.logical_block_size = blk::sector_size,
+                           .chunk_shift = blk::min_chunk_shift,
+                           .image_key = image_key,
+                           .key_id = {}};
+        if (image_key) {
+            o.key_id[0] = std::byte{1};
+        }
+        const auto packed = blk::pack_image(in, raw.size(), data, o);
+        BOOST_REQUIRE(packed.has_value());
+        std::vector<std::byte> stored(raw.size());
+        BOOST_REQUIRE(::pread(data, stored.data(), stored.size(), 0) ==
+                      static_cast<ssize_t>(stored.size()));
+        ::close(in);
+        ::close(data);
+        const auto hex = blk::image_name_hex(packed->name);
+        store.put(blk::image_manifest_key(image_prefix, hex), packed->manifest_bytes);
+        store.put(blk::image_data_key(image_prefix, hex), std::move(stored));
+        return packed->name;
+    }
+
+    auto create_image(std::uint64_t volume, std::uint64_t owner, const oar::ImageName& name,
+                      std::uint16_t store_id = image_store_id) -> oar::Status {
+        return role->create_volume({.volume_id = volume,
+                                    .owner_vm = owner,
+                                    .capacity_sectors = volume_sectors,
+                                    .block_size = blk::sector_size,
+                                    .wrapped_key = {},
+                                    .image_store = store_id,
+                                    .image_name = name});
     }
 
     auto create(std::uint64_t volume, std::uint64_t owner, std::uint8_t fill = wrapped_fill)
@@ -283,7 +390,9 @@ struct Rig {
                                     .owner_vm = owner,
                                     .capacity_sectors = volume_sectors,
                                     .block_size = blk::sector_size,
-                                    .wrapped_key = wrapped});
+                                    .wrapped_key = wrapped,
+                                    .image_store = 0,
+                                    .image_name = {}});
     }
     auto prepare(oar::FunctionNumber fn, std::uint64_t vm, std::uint64_t volume) -> oar::Status {
         return role->prepare_function({.fn = fn,
@@ -543,6 +652,149 @@ BOOST_AUTO_TEST_CASE(helm_drives_the_role_over_the_sideband) {
     BOOST_TEST((g.write(marker_sector, marker()) == Status::ok));
     BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
     BOOST_TEST(!contains(file_bytes(rig.role->volume_path(vol_one)), marker()));
+}
+
+// ---- image volumes (task 13) ---------------------------------------------
+
+// A 96 KiB image (one full 64 KiB chunk and a 32 KiB tail) of numbered
+// sectors, the marker at marker_sector; the 128 KiB volume reads zeros past it.
+constexpr std::uint64_t image_sectors = 192;
+
+auto image_raw() -> std::vector<std::byte> {
+    std::vector<std::byte> raw(image_sectors * blk::sector_size);
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        raw[i] = static_cast<std::byte>((i / blk::sector_size) + 1);
+    }
+    const auto m = marker();
+    std::ranges::copy(m,
+                      raw.begin() + static_cast<std::ptrdiff_t>(marker_sector * blk::sector_size));
+    return raw;
+}
+
+auto sector_of(const std::vector<std::byte>& raw, std::uint64_t sector) -> std::vector<std::byte> {
+    const auto from = static_cast<std::ptrdiff_t>(sector * blk::sector_size);
+    return {raw.begin() + from, raw.begin() + from + static_cast<std::ptrdiff_t>(blk::sector_size)};
+}
+
+BOOST_AUTO_TEST_CASE(image_volume_create_writes_only_a_header) {
+    Rig rig{true};
+    const auto name = rig.publish(image_raw());
+    BOOST_TEST((rig.create_image(vol_one, vm_one, name) == oar::Status::ok));
+    const auto path = rig.role->volume_path(vol_one);
+    BOOST_TEST(std::filesystem::file_size(path) == blk::metadata_block_size);
+    const auto m = blk::FileBackend::read_metadata(path);
+    BOOST_REQUIRE(m.has_value());
+    BOOST_REQUIRE(m->image.has_value());
+    BOOST_TEST(m->image->store_id == image_store_id);
+    BOOST_TEST((m->image->name == name));
+    BOOST_TEST(m->wrapped_key.empty());
+    BOOST_TEST((rig.create_image(vol_one, vm_one, name) == oar::Status::failed));  // exists
+    // A store the role does not know, or a role with no image stores.
+    BOOST_TEST((rig.create_image(vol_two, vm_one, name, 9) == oar::Status::unsupported));
+    Rig plain;
+    BOOST_TEST((plain.create_image(vol_two, vm_one, name) == oar::Status::unsupported));
+    // Image volumes cannot be rewrapped yet (no key to rewrap); delete works.
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    BOOST_TEST((rig.role->rewrap_volume(
+                    {.volume_id = vol_one, .owner_vm = vm_two, .wrapped_key = wrapped}) ==
+                oar::Status::failed));
+    BOOST_TEST((rig.role->delete_volume({.volume_id = vol_one}) == oar::Status::ok));
+    BOOST_TEST(!std::filesystem::exists(path));
+}
+
+BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
+    Rig rig{true};
+    const auto raw = image_raw();
+    const auto name = rig.publish(raw);
+    BOOST_REQUIRE(rig.create_image(vol_one, vm_one, name) == oar::Status::ok);
+    BOOST_TEST((rig.prepare(fn0, vm_two, vol_one) == oar::Status::failed));  // not the owner
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_one) == oar::Status::ok);
+    rig.t0.flr();  // the VMM opens the function
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+
+    Guest g{rig.ram0, *rig.t0.served()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST(g.read(far_sector) == std::vector<std::byte>(blk::sector_size),
+               boost::test_tools::per_element());  // past the image: zeros
+    BOOST_TEST(g.serial() == blk::volume_serial(vol_one));
+
+    // Writes land in the overlay and read back...
+    const std::vector<std::byte> mine(blk::sector_size, std::byte{0xEE});
+    BOOST_TEST((g.write(3, mine) == Status::ok));
+    BOOST_TEST((g.write(far_sector, mine) == Status::ok));
+    BOOST_TEST(g.read(3) == mine, boost::test_tools::per_element());
+    BOOST_TEST(g.read(far_sector) == mine, boost::test_tools::per_element());
+    // ...never reaching the object store or the volume file.
+    const auto stored =
+        rig.store.get(blk::image_data_key(image_prefix, blk::image_name_hex(name)), 1U << 20U, {});
+    BOOST_TEST(!contains(*stored, mine));
+    BOOST_TEST(std::filesystem::file_size(rig.role->volume_path(vol_one)) ==
+               blk::metadata_block_size);
+
+    // An FLR takes the key and the overlay: with a new key the image is as
+    // it was.
+    rig.t0.flr();
+    BOOST_TEST(!rig.role->function(fn0)->holds_key());
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    Guest g2{rig.ram0, *rig.t0.served()};
+    BOOST_REQUIRE(g2.up());
+    BOOST_TEST(g2.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST(g2.read(far_sector) == std::vector<std::byte>(blk::sector_size),
+               boost::test_tools::per_element());
+
+    // So does drop_key, and so does detach (cleaning) and a new attachment.
+    BOOST_TEST((g2.write(3, mine) == Status::ok));
+    BOOST_TEST((rig.role->drop_key({.fn = fn0, .volume_id = vol_one}) == oar::Status::ok));
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    BOOST_TEST(g2.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST((g2.write(3, mine) == Status::ok));
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
+    BOOST_REQUIRE(rig.prepare(fn1, vm_one, vol_one) == oar::Status::ok);
+    BOOST_REQUIRE(rig.deliver(fn1, vol_one) == oar::Status::ok);
+    Guest g3{rig.ram1, *rig.t1.served()};
+    BOOST_REQUIRE(g3.up());
+    BOOST_TEST(g3.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {
+    Rig rig{true};
+    const auto name = rig.publish(image_raw());
+    // Named but never published.
+    oar::ImageName missing = name;
+    missing[0] ^= std::byte{1};
+    BOOST_REQUIRE(rig.create_image(vol_one, vm_one, missing) == oar::Status::ok);
+    BOOST_TEST((rig.prepare(fn0, vm_one, vol_one) == oar::Status::failed));
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
+
+    // The store answers with another image's manifest under this name.
+    auto other = image_raw();
+    other[0] = std::byte{0x77};
+    const auto other_name = rig.publish(other);
+    const auto other_manifest = rig.store.get(
+        blk::image_manifest_key(image_prefix, blk::image_name_hex(other_name)), 1U << 26U, {});
+    rig.store.put(blk::image_manifest_key(image_prefix, blk::image_name_hex(missing)),
+                  *other_manifest);
+    BOOST_TEST((rig.prepare(fn0, vm_one, vol_one) == oar::Status::failed));
+
+    // An encrypted image waits for helm to deliver its key (task 15).
+    const auto key = test_key();
+    const auto secret = rig.publish(image_raw(), blk::XtsKey{key});
+    BOOST_REQUIRE(rig.create_image(vol_two, vm_one, secret) == oar::Status::ok);
+    BOOST_TEST((rig.prepare(fn0, vm_one, vol_two) == oar::Status::failed));
+
+    // The image is fine but the volume is smaller than it.
+    BOOST_REQUIRE(rig.role->create_volume({.volume_id = 0x203,
+                                           .owner_vm = vm_one,
+                                           .capacity_sectors = image_sectors - 8,
+                                           .block_size = blk::sector_size,
+                                           .wrapped_key = {},
+                                           .image_store = image_store_id,
+                                           .image_name = name}) == oar::Status::ok);
+    BOOST_TEST((rig.prepare(fn0, vm_one, 0x203) == oar::Status::failed));
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -86,7 +86,8 @@ auto metadata() -> VolumeMetadata {
             .owner_vm = owner_a,
             .capacity_sectors = capacity,
             .logical_block_size = 512,
-            .wrapped_key = wrapped(1)};
+            .wrapped_key = wrapped(1),
+            .image = std::nullopt};
 }
 
 // A fresh directory per test, removed afterwards.
@@ -339,6 +340,98 @@ BOOST_AUTO_TEST_CASE(erase_removes_everything, *boost::unit_test::timeout(unit_t
     BOOST_TEST(!std::filesystem::exists(path));
     BOOST_TEST(!contains(read_file(dir.file("shadow")), wrapped(1)));
     BOOST_TEST(FileBackend::erase(path).error().error == FileError::not_found);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(image_volumes)
+
+auto image_metadata(std::size_t key_len = 0) -> VolumeMetadata {
+    auto m = metadata();
+    m.wrapped_key = wrapped(3, key_len);
+    blk::ImageSource src{.store_id = 7, .name = {}};
+    for (std::size_t i = 0; i < src.name.size(); ++i) {
+        src.name[i] = static_cast<std::byte>(0x50 + i);
+    }
+    m.image = src;
+    return m;
+}
+
+// Version 2 puts the image source after the key and the digest after it.
+constexpr std::size_t image_store_offset = digest_offset;
+constexpr std::size_t image_name_offset = image_store_offset + 8;
+constexpr std::size_t image_digest_offset = image_name_offset + blk::image_name_size;
+
+BOOST_AUTO_TEST_CASE(header_round_trips_as_version_2,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    for (const std::size_t key_len : {std::size_t{0}, wrapped_size}) {
+        const auto m = image_metadata(key_len);
+        const auto block = blk::encode_metadata(m);
+        BOOST_REQUIRE(block.has_value());
+        BOOST_TEST(std::to_integer<int>((*block)[8]) == blk::metadata_version_image);
+        BOOST_TEST(std::to_integer<int>((*block)[image_store_offset]) == 7);
+        const auto back = blk::decode_metadata(*block);
+        BOOST_REQUIRE(back.has_value());
+        BOOST_TEST((*back == m));
+    }
+    // A disk volume still encodes as version 1.
+    BOOST_TEST(std::to_integer<int>(blk::encode_metadata(metadata()).value()[8]) ==
+               blk::metadata_version);
+}
+
+BOOST_AUTO_TEST_CASE(header_rejects_bad_image_fields,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto m = image_metadata();
+    m.image->store_id = 0;
+    BOOST_TEST((blk::encode_metadata(m).error() == MetadataError::bad_image_source));
+    m = image_metadata();
+    m.image->name = {};
+    BOOST_TEST((blk::encode_metadata(m).error() == MetadataError::bad_image_source));
+    // Only an image volume may go without a key.
+    m = metadata();
+    m.wrapped_key.clear();
+    BOOST_TEST((blk::encode_metadata(m).error() == MetadataError::bad_key_length));
+
+    const auto good = blk::encode_metadata(image_metadata()).value();
+    auto b = good;
+    b[image_name_offset] ^= std::byte{1};  // the digest covers the image source
+    BOOST_TEST((blk::decode_metadata(b).error() == MetadataError::bad_digest));
+    b = good;
+    b[image_digest_offset + 32] = std::byte{1};
+    BOOST_TEST((blk::decode_metadata(b).error() == MetadataError::nonzero_padding));
+    b = good;
+    b[8] = std::byte{1};  // a version-2 header read as version 1
+    BOOST_TEST((blk::decode_metadata(b).error() == MetadataError::bad_digest));
+    b = good;
+    b[8] = std::byte{3};
+    BOOST_TEST((blk::decode_metadata(b).error() == MetadataError::unsupported_version));
+}
+
+BOOST_AUTO_TEST_CASE(file_is_only_the_header, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const TempDir dir;
+    const auto path = dir.file("vol.akv");
+    const auto m = image_metadata();
+    BOOST_REQUIRE(FileBackend::create_image_volume(path, m).has_value());
+    BOOST_TEST(std::filesystem::file_size(path) == blk::metadata_block_size);
+    const auto back = FileBackend::read_metadata(path);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == m));
+    // Not a disk: open() and create() refuse it, and it is never overwritten.
+    BOOST_TEST((FileBackend::open(path).error().error == FileError::image_volume));
+    BOOST_TEST(
+        (FileBackend::create(dir.file("other.akv"), m).error().error == FileError::image_volume));
+    BOOST_TEST((FileBackend::create_image_volume(path, m).error().error == FileError::exists));
+    BOOST_TEST((FileBackend::create_image_volume(dir.file("disk.akv"), metadata()).error().error ==
+                FileError::bad_metadata));
+    // A disk volume's file read the same way.
+    BOOST_REQUIRE(FileBackend::create(dir.file("disk.akv"), metadata()).has_value());
+    BOOST_TEST((FileBackend::read_metadata(dir.file("disk.akv")).value() == metadata()));
+    // An image header with data behind it is not an image volume file.
+    std::filesystem::resize_file(path, 2 * blk::metadata_block_size);
+    BOOST_TEST((FileBackend::read_metadata(path).error().error == FileError::size_mismatch));
+    std::filesystem::resize_file(path, blk::metadata_block_size);
+    BOOST_REQUIRE(FileBackend::erase(path).has_value());
+    BOOST_TEST(!std::filesystem::exists(path));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -244,9 +244,41 @@ changes the function's request loop, so it is a separate task.
 | DELETE_VOLUME | removes the descriptor; nothing to crypto-erase but the wrapped K_img copy |
 | REWRAP_VOLUME | changes owner; only meaningful for K_img |
 
-The protocol fields (controller, mailbox, sideband `DeliverKey` with a
-second key) belong to the task that wires this in; until then the
-backend is exercised from tests and a role option.
+On the storage role (task 13, role side):
+
+- **Sideband.** `create_volume` names the image in the reserved field at
+  offset 30, now `image_store`. Zero means a disk volume, exactly as
+  before. Non-zero means an image volume: a 32-byte image name follows the
+  head, then the wrapped key. `key_len` may be 0, for a plain image. A peer
+  that predates this refuses the field as a reserved byte set, so it fails
+  closed.
+- **Volume file.** A version-2 header (`FileBackend::create_image_volume`)
+  adds `store_id u16 | reserved u16 | reserved u32 | image name [32]`
+  after the key field, under the same SHA-256. The file is just that 4 KiB
+  header. `FileBackend::open` refuses it as `image_volume`, and
+  `read_metadata` reads either kind.
+- **Prepare.** `prepare_function` reads the header. For an image volume it
+  fetches `<prefix>/<name>/manifest` from the configured store (10 s
+  deadline) and checks it against the name. It refuses an encrypted image
+  until task 15. It then opens the image in the shared `ChunkCache` and
+  serves a `LazyImageBackend` with a fresh overlay. The capacity must hold
+  the image.
+- **Keys.** `deliver_key` gives the key to the function and to the
+  backend. `drop_key`, cleaning and FLR take it from both, which discards
+  the overlay.
+- **Configuration.** ak-oar-blk is configured with
+  `--image-store ID=PATH` (one file per store: endpoint, bucket, prefix,
+  region, style, CA file and read-only credentials; see
+  `image_store_config.hpp`), `--image-cache DIR` and
+  `--image-cache-bytes N`. `create_volume` naming a store the role does
+  not have answers `unsupported`.
+- **Rewrap.** `rewrap_volume` of an image volume fails: there is no key to
+  rewrap until task 15.
+
+helm's half (task 13, helm side) is still open. It covers CREATE_VOLUME
+with an image source on the mailbox, no volume key for image volumes,
+K_eph drawn and delivered at ATTACH_VOLUME, and ownership kept without a
+KeyStore entry.
 
 Open: how a storage board reaches the object store (through an oar-net
 function, or its own uplink); on harbor the oar-blk process uses L1's

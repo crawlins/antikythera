@@ -8,6 +8,7 @@
 //   ak-oar-blk --volumes DIR --sideband PATH --addr A --helm-addr A
 //              --eid E --helm-eid E --function SOCKET [--function SOCKET ...]
 //              [--queues N]
+//              [--image-cache DIR [--image-cache-bytes N] --image-store ID=PATH ...]
 //
 // Function i is the i-th --function: L0 QEMU attaches to its socket with
 // vfio-user-pci when the L1 host boots, and the L1 host binds it to
@@ -19,6 +20,14 @@
 // serves one helm connection at a time with BlkRole. --addr/--eid are
 // this board's bus address and EID, --helm-addr/--helm-eid helm's, as in
 // helm's `slot` directive. If helm goes away the process listens again.
+//
+// Image volumes (task 13): each --image-store names an object store by the
+// ID helm's create_volume uses (1..65535) and the file that configures it
+// (image_store_config.hpp); a file holding a secret key must not be
+// readable by group or others. --image-cache is the directory for the
+// chunk cache all image volumes share (one unlinked file per image, so
+// nothing survives the process), --image-cache-bytes its budget (default
+// 1 GiB). Overlays go in the volume directory, also as unlinked files.
 //
 // Volume keys arrive only over the sideband and live only in each
 // function's locked key slot; the process disables core dumps and ptrace
@@ -33,6 +42,9 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -47,6 +59,10 @@
 #include "helm/oar_link.hpp"
 #include "helm/sideband_binding.hpp"
 #include "oar/blk/blk_role.hpp"
+#include "oar/blk/chunk_cache.hpp"
+#include "oar/blk/fetcher.hpp"
+#include "oar/blk/image_store_config.hpp"
+#include "oar/blk/s3_object_store.hpp"
 #include "oar/blk/key_slot.hpp"
 #include "oar/vfu/virtio_binding.hpp"
 
@@ -63,6 +79,12 @@ constexpr std::string_view arg_eid = "--eid";
 constexpr std::string_view arg_helm_eid = "--helm-eid";
 constexpr std::string_view arg_function = "--function";
 constexpr std::string_view arg_queues = "--queues";
+constexpr std::string_view arg_image_cache = "--image-cache";
+constexpr std::string_view arg_image_cache_bytes = "--image-cache-bytes";
+constexpr std::string_view arg_image_store = "--image-store";
+constexpr std::uint64_t default_image_cache_bytes = std::uint64_t{1} << 30U;
+constexpr std::uint64_t max_store_id = 0xFFFF;
+constexpr mode_t group_other_bits = 077;
 constexpr std::string_view log_name = "ak-oar-blk";
 constexpr int base_auto = 0;
 constexpr int poll_forever = -1;
@@ -75,9 +97,11 @@ constexpr auto no_wait = std::chrono::milliseconds{0};
 
 auto usage() -> int {
     std::println(stderr,
-                 "usage: {} {} DIR {} PATH {} A {} A {} E {} E {} SOCKET [{} SOCKET ...] [{} N]",
+                 "usage: {} {} DIR {} PATH {} A {} A {} E {} E {} SOCKET [{} SOCKET ...] [{} N]\n"
+                 "       [{} DIR [{} N] {} ID=PATH ...]",
                  log_name, arg_volumes, arg_sideband, arg_addr, arg_helm_addr, arg_eid,
-                 arg_helm_eid, arg_function, arg_function, arg_queues);
+                 arg_helm_eid, arg_function, arg_function, arg_queues, arg_image_cache,
+                 arg_image_cache_bytes, arg_image_store);
     return exit_usage;
 }
 
@@ -142,6 +166,9 @@ struct Options {
     std::optional<std::uint64_t> eid;
     std::optional<std::uint64_t> helm_eid;
     std::uint64_t queues{1};
+    std::string image_cache;
+    std::uint64_t image_cache_bytes{default_image_cache_bytes};
+    std::map<std::uint16_t, std::string> image_stores;
 };
 
 auto parse(int argc, char** argv) -> std::optional<Options> {
@@ -172,15 +199,65 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
                 return std::nullopt;
             }
             o.queues = *q;
+        } else if (arg == arg_image_cache) {
+            o.image_cache = value;
+        } else if (arg == arg_image_cache_bytes) {
+            auto n = parse_u64(value, UINT64_MAX);
+            if (!n || *n == 0) {
+                return std::nullopt;
+            }
+            o.image_cache_bytes = *n;
+        } else if (arg == arg_image_store) {
+            const auto eq = value.find('=');
+            const auto id = parse_u64(value.substr(0, eq), max_store_id);
+            if (eq == std::string_view::npos || !id || *id == 0 || eq + 1 == value.size() ||
+                !o.image_stores.emplace(static_cast<std::uint16_t>(*id), value.substr(eq + 1))
+                     .second) {
+                return std::nullopt;
+            }
         } else {
             return std::nullopt;
         }
     }
     if (o.volumes.empty() || o.sideband.empty() || o.functions.empty() || !o.addr || !o.helm_addr ||
-        !o.eid || !o.helm_eid) {
+        !o.eid || !o.helm_eid || o.image_stores.empty() != o.image_cache.empty()) {
         return std::nullopt;
     }
     return o;
+}
+
+// One configured image store and the fetcher in front of it.
+struct LoadedStore {
+    std::unique_ptr<blk::S3ObjectStore> store;
+    std::unique_ptr<blk::Fetcher> fetcher;
+    std::string prefix;
+};
+
+auto load_store(const std::string& path) -> std::expected<LoadedStore, std::string> {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        return std::unexpected(std::format("{}: {}", path, std::strerror(errno)));
+    }
+    std::ifstream in{path};
+    if (!in) {
+        return std::unexpected(std::format("{}: cannot read", path));
+    }
+    const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    auto cfg = blk::parse_image_store_config(text);
+    if (!cfg) {
+        return std::unexpected(std::format("{}: {}", path, cfg.error()));
+    }
+    if (cfg->s3.credentials && (st.st_mode & group_other_bits) != 0) {
+        return std::unexpected(
+            std::format("{}: holds a secret key but is readable by group or others", path));
+    }
+    auto store = blk::S3ObjectStore::create(std::move(cfg->s3));
+    if (!store) {
+        return std::unexpected(std::format("{}: {}", path, blk::to_string(store.error())));
+    }
+    LoadedStore out{.store = std::move(*store), .fetcher = nullptr, .prefix = cfg->prefix};
+    out.fetcher = blk::Fetcher::create(*out.store, blk::FetcherConfig{});
+    return out;
 }
 
 }  // namespace
@@ -207,6 +284,30 @@ auto main(int argc, char** argv) -> int {
         transports.push_back(std::make_unique<VfuTransport>(std::move(*b)));
         raw.push_back(transports.back().get());
     }
+    // Image stores, their fetchers and the cache outlive the role.
+    std::map<std::uint16_t, LoadedStore> stores;
+    std::map<std::uint16_t, blk::ImageStore> image_stores;
+    std::unique_ptr<blk::ChunkCache> cache;
+    if (!opts->image_cache.empty()) {
+        auto c = blk::ChunkCache::create(opts->image_cache, opts->image_cache_bytes);
+        if (!c) {
+            std::println(stderr, "{}: image cache {}: {}", log_name, opts->image_cache,
+                         std::strerror(c.error()));
+            return EXIT_FAILURE;
+        }
+        cache = std::move(*c);
+        for (const auto& [id, path] : opts->image_stores) {
+            auto loaded = load_store(path);
+            if (!loaded) {
+                std::println(stderr, "{}: image store {}: {}", log_name, id, loaded.error());
+                return EXIT_FAILURE;
+            }
+            auto& l = stores.emplace(id, std::move(*loaded)).first->second;
+            image_stores[id] = {
+                .store = l.store.get(), .fetcher = l.fetcher.get(), .prefix = l.prefix};
+        }
+    }
+    const blk::RoleConfig defaults;
     auto role =
         blk::BlkRole::create({.volume_dir = opts->volumes,
                               .num_queues = static_cast<std::uint16_t>(opts->queues),
@@ -214,6 +315,12 @@ auto main(int argc, char** argv) -> int {
                               .seg_max = blk::VolumeGeometry{}.seg_max,
                               .max_transfer_bytes = blk::VolumeGeometry{}.max_transfer_bytes,
                               .budget = blk::BlkParams{}.budget,
+                              .image_stores = std::move(image_stores),
+                              .image_cache = cache.get(),
+                              .overlay_dir = {},
+                              .overlay_limit_bytes = 0,
+                              .max_readahead_chunks = defaults.max_readahead_chunks,
+                              .manifest_deadline = defaults.manifest_deadline,
                               .clock = {}},
                              raw);
     if (!role) {
@@ -237,8 +344,8 @@ auto main(int argc, char** argv) -> int {
         .timeout = {}};
     std::unique_ptr<helm::SocketBinding> sideband;
     std::unique_ptr<helm::OarEndpoint> endpoint;
-    std::println(stderr, "{}: {} function(s), volumes in {}, sideband {}", log_name,
-                 transports.size(), opts->volumes, opts->sideband);
+    std::println(stderr, "{}: {} function(s), volumes in {}, {} image store(s), sideband {}",
+                 log_name, transports.size(), opts->volumes, stores.size(), opts->sideband);
 
     bool more = false;
     for (;;) {

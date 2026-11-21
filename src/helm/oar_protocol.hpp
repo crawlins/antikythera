@@ -29,8 +29,9 @@
 //   group_policy        0  frame [group_policy_frame_size] (proto::GroupPolicy, signed)
 //   group_usage         0  cursor u16 | 2  reserved u16
 //   create_volume       0  volume_id u64 | 8  owner_vm u64 | 16 capacity_sectors u64
-//                       24 block_size u32 | 28 key_len u16 | 30 reserved u16
-//                       32 wrapped_key [key_len]
+//                       24 block_size u32 | 28 key_len u16 | 30 image_store u16
+//                       32 image_name [32], only when image_store != 0
+//                       wrapped_key [key_len]
 //   delete_volume       0  volume_id u64
 //   rewrap_volume       0  volume_id u64 | 8  owner_vm u64 | 16 key_len u16
 //                       18 reserved u16 | 20 reserved u32 | 24 wrapped_key [key_len]
@@ -54,6 +55,12 @@
 // opaque to the role (helm authenticates it on unwrap); key_len is 1 to
 // max_wrapped_volume_key. capacity_sectors counts 512-byte sectors, is
 // non-zero and a whole number of logical blocks; block_size is 512 or 4096.
+// A non-zero image_store makes it an image volume (oar-blk Requirement 8,
+// task 13): the image named image_name (the SHA-256 of its manifest, never
+// all zero) in the object store the role knows by that ID, under a
+// throwaway overlay. Such a volume needs no volume key; key_len is 0 for a
+// plain image, or carries the wrapped image key of an encrypted one. Its
+// attachment key is the ephemeral one helm delivers with deliver_key.
 //
 // map_update forwards one controller MapUpdate frame (src/proto/map_update.hpp)
 // unmodified, signature included, so the role can check it itself. A full
@@ -146,6 +153,8 @@ inline constexpr std::size_t remove_tunnel_peer_size = vtep_size;
 // Room for a later wrapped-key format; helm's format 1 is 95 bytes. Equal
 // to oar-blk's max_wrapped_key_size (the field in its volume header).
 inline constexpr std::size_t max_wrapped_volume_key = 256;
+inline constexpr std::size_t image_name_size = 32;  // SHA-256 of an image manifest
+using ImageName = std::array<std::byte, image_name_size>;
 inline constexpr std::uint32_t sector_size = 512;
 // Largest volume a request may describe: its byte size still fits an off_t
 // with room for the role's metadata.
@@ -223,6 +232,7 @@ enum class BodyError : std::uint8_t {
     bad_geometry,       // block size not 512/4096, or capacity zero, ragged or too large
     bad_key_length,     // wrapped key empty, too long, or not the length the body says
     zero_key,           // a tunnel private or public key is all zero
+    bad_image,          // an image volume's image name is all zero
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -286,6 +296,8 @@ struct CreateVolume {
     std::uint64_t capacity_sectors{0};
     std::uint32_t block_size{sector_size};
     std::span<const std::byte> wrapped_key;
+    std::uint16_t image_store{0};  // non-zero: an image volume
+    ImageName image_name{};        // set exactly when image_store is
 };
 
 struct DeleteVolume {

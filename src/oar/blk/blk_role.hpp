@@ -29,6 +29,17 @@
 // volume. Every function, placeholder or not, has the same queues and so
 // the same PCI shape, which is what lets a transport swap them.
 //
+// Image volumes (Requirement 8, task 13): create_volume with an image
+// source writes a header-only volume file naming the store and image;
+// prepare_function fetches the image's manifest from that store, checks it
+// against the name, and serves the volume with a LazyImageBackend over the
+// shared chunk cache, with a fresh, empty overlay. The key helm delivers is
+// the attachment's ephemeral key: it goes to the function and to the
+// backend, which re-encrypts image blocks under it. Every way the key goes
+// (drop_key, cleaning, FLR) discards the overlay with it, so an image
+// volume never comes back with an earlier attachment's writes. Encrypted
+// images (task 15) are refused until helm can deliver their image key.
+//
 // The volume files are named vol-<16 hex digits>.akv in the volume
 // directory. The role checks a volume's header against the request: a
 // prepare for a VM other than the volume's owner is refused, as helm's
@@ -42,12 +53,18 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "helm/oar_link.hpp"
+#include "oar/blk/chunk_cache.hpp"
+#include "oar/blk/fetcher.hpp"
+#include "oar/blk/file_backend.hpp"
+#include "oar/blk/lazy_image_backend.hpp"
+#include "oar/blk/object_store.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 
 namespace ak::oar::blk {
@@ -73,6 +90,14 @@ public:
         -> std::expected<void, std::string> = 0;
 };
 
+// An object store image volumes can name, as the role is configured with
+// it. Both pointers must outlive the role.
+struct ImageStore {
+    ObjectStore* store{nullptr};
+    Fetcher* fetcher{nullptr};  // fetches from `store`
+    std::string prefix;         // object keys are <prefix>/<image name>/...
+};
+
 struct RoleConfig {
     using Clock = std::chrono::steady_clock;
 
@@ -82,6 +107,14 @@ struct RoleConfig {
     std::uint32_t seg_max{128};
     std::uint32_t max_transfer_bytes{1U << 20U};
     std::size_t budget{256};
+    // Image volumes: the stores by ID, the chunk cache they share (must
+    // outlive the role; null: no image volumes), and the overlays.
+    std::map<std::uint16_t, ImageStore> image_stores;
+    ChunkCache* image_cache{nullptr};
+    std::filesystem::path overlay_dir;     // empty: volume_dir
+    std::uint64_t overlay_limit_bytes{0};  // per volume; 0: up to its capacity
+    std::uint32_t max_readahead_chunks{8};
+    std::chrono::milliseconds manifest_deadline{10000};
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
 };
@@ -133,6 +166,7 @@ private:
         std::unique_ptr<VirtioBlkFunction> placeholder;
         std::unique_ptr<VirtioBlkFunction> active;
         std::uint64_t volume{0};
+        LazyImageBackend* image{nullptr};  // the active function's backend, for an image volume
     };
 
     explicit BlkRole(RoleConfig config) : _config{std::move(config)} {}
@@ -143,6 +177,9 @@ private:
         -> BlkParams;
     // Wipes the key, closes the volume and puts the placeholder back.
     auto close(Slot& s) -> bool;
+    // The backend for an image volume, ready for its key.
+    [[nodiscard]] auto open_image_volume(const VolumeMetadata& m)
+        -> std::expected<std::unique_ptr<LazyImageBackend>, std::string>;
 
     RoleConfig _config;
     std::vector<Slot> _slots;

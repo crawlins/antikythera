@@ -200,7 +200,22 @@ auto check_create_volume(const CreateVolume& c) noexcept -> std::expected<void, 
         c.capacity_sectors % (c.block_size / sector_size) != 0) {
         return std::unexpected(BodyError::bad_geometry);
     }
-    return check_wrapped_key(c.wrapped_key);
+    const bool zero_name =
+        std::ranges::all_of(c.image_name, [](std::byte b) { return b == std::byte{0}; });
+    if (c.image_store == 0) {
+        if (!zero_name) {
+            return std::unexpected(BodyError::bad_image);
+        }
+        return check_wrapped_key(c.wrapped_key);
+    }
+    if (zero_name) {
+        return std::unexpected(BodyError::bad_image);
+    }
+    // An image volume may have no key (a plain image).
+    if (c.wrapped_key.size() > max_wrapped_volume_key) {
+        return std::unexpected(BodyError::bad_key_length);
+    }
+    return {};
 }
 
 auto check_rewrap_volume(const RewrapVolume& r) noexcept -> std::expected<void, BodyError> {
@@ -476,14 +491,17 @@ auto encode_create_volume(const CreateVolume& c)
         return std::unexpected(ok.error());
     }
     std::vector<std::byte> out;
-    out.reserve(create_volume_head_size + c.wrapped_key.size());
+    out.reserve(create_volume_head_size + image_name_size + c.wrapped_key.size());
     wire::Writer w{out};
     w.le64(c.volume_id);
     w.le64(c.owner_vm);
     w.le64(c.capacity_sectors);
     w.le32(c.block_size);
     w.le16(static_cast<std::uint16_t>(c.wrapped_key.size()));
-    w.le16(zero16);
+    w.le16(c.image_store);
+    if (c.image_store != 0) {
+        w.bytes(c.image_name);
+    }
     w.bytes(c.wrapped_key);
     return out;
 }
@@ -500,8 +518,23 @@ auto decode_create_volume(std::span<const std::byte> body) noexcept
     c.capacity_sectors = r.le64().value_or(0);
     c.block_size = r.le32().value_or(0);
     const auto key_len = r.le16().value_or(0);
-    if (r.le16().value_or(0) != 0) {
-        return std::unexpected(BodyError::reserved_not_zero);
+    c.image_store = r.le16().value_or(0);
+    if (c.image_store != 0) {
+        const auto name = r.bytes(image_name_size);
+        if (!name) {
+            return std::unexpected(BodyError::truncated);
+        }
+        std::ranges::copy(*name, c.image_name.begin());
+        // A plain image's volume has no key: nothing may follow the name.
+        if (key_len == 0) {
+            if (r.remaining() != 0) {
+                return std::unexpected(BodyError::bad_key_length);
+            }
+            if (auto ok = check_create_volume(c); !ok) {
+                return std::unexpected(ok.error());
+            }
+            return c;
+        }
     }
     auto key = read_wrapped_key(r, key_len);
     if (!key) {
@@ -1013,6 +1046,8 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "bad_key_length";
         case BodyError::zero_key:
             return "zero_key";
+        case BodyError::bad_image:
+            return "bad_image";
         case BodyError::status_with_body:
             return "status_with_body";
     }

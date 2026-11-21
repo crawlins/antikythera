@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "oar/blk/file_backend.hpp"
+#include "oar/blk/image_manifest.hpp"
 
 namespace ak::oar::blk {
 
@@ -40,9 +41,20 @@ public:
     }
 };
 
-auto on_flr(VirtioBlkFunction& f) -> std::function<void()> {
-    return [fn = &f] { fn->function_reset(); };
+// FLR wipes the function's key; for an image volume the backend's copy
+// goes too, and the overlay with it.
+auto on_flr(VirtioBlkFunction& f, LazyImageBackend* image = nullptr) -> std::function<void()> {
+    return [fn = &f, image] {
+        fn->function_reset();
+        if (image != nullptr) {
+            image->drop_keys();
+        }
+    };
 }
+
+// Largest manifest: the header and 2^20 chunk digests (32 MiB).
+constexpr std::size_t max_manifest_bytes =
+    manifest_header_size + (std::size_t{max_image_chunks} * image_digest_size);
 
 }  // namespace
 
@@ -130,15 +142,62 @@ auto BlkRole::close(Slot& s) -> bool {
         return true;
     }
     s.active->drop_key();
+    if (s.image != nullptr) {
+        s.image->drop_keys();
+    }
     // The placeholder goes back first, so the transport never points at a
     // destroyed function.
     s.placeholder->function_reset();
     if (auto ok = s.transport->serve(s.placeholder->pci(), on_flr(*s.placeholder)); !ok) {
         return false;
     }
+    s.image = nullptr;
     s.active.reset();
     s.volume = 0;
     return true;
+}
+
+auto BlkRole::open_image_volume(const VolumeMetadata& m)
+    -> std::expected<std::unique_ptr<LazyImageBackend>, std::string> {
+    const auto store = _config.image_stores.find(m.image->store_id);
+    if (_config.image_cache == nullptr || store == _config.image_stores.end() ||
+        store->second.store == nullptr || store->second.fetcher == nullptr) {
+        return std::unexpected(std::format("no image store {}", m.image->store_id));
+    }
+    const ImageStore& is = store->second;
+    const std::string hex = image_name_hex(m.image->name);
+    const auto deadline = ObjectStore::Clock::now() + _config.manifest_deadline;
+    const auto bytes =
+        is.store->get(image_manifest_key(is.prefix, hex), max_manifest_bytes, deadline);
+    if (!bytes) {
+        return std::unexpected(std::format("manifest {}: {}", hex, to_string(bytes.error())));
+    }
+    // The name pins the manifest: a store that returns another one is caught here.
+    const auto manifest = decode_named_manifest(*bytes, m.image->name);
+    if (!manifest) {
+        return std::unexpected(std::format("manifest {}: {}", hex, to_string(manifest.error())));
+    }
+    if (manifest->encrypted) {
+        // Needs the image key from helm (task 15).
+        return std::unexpected(std::format("image {} is encrypted", hex));
+    }
+    auto image =
+        _config.image_cache->open_image(m.image->name, *manifest, image_data_key(is.prefix, hex));
+    if (!image) {
+        return std::unexpected(std::format("image {}: cache errno {}", hex, image.error()));
+    }
+    auto backend = LazyImageBackend::create(
+        {.image = std::move(*image),
+         .fetcher = is.fetcher,
+         .overlay_dir = _config.overlay_dir.empty() ? _config.volume_dir : _config.overlay_dir,
+         .capacity_bytes = m.capacity_sectors * sector_size,
+         .logical_block_size = m.logical_block_size,
+         .overlay_limit_bytes = _config.overlay_limit_bytes,
+         .max_readahead_chunks = _config.max_readahead_chunks});
+    if (!backend) {
+        return std::unexpected(std::format("image {}: {}", hex, to_string(backend.error())));
+    }
+    return std::move(*backend);
 }
 
 // ---- functions -------------------------------------------------------------
@@ -164,35 +223,49 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (s->active || slot_of_volume(cfg->volume_id) != nullptr) {
         return oar::Status::busy;
     }
-    auto backend = FileBackend::open(volume_path(cfg->volume_id));
-    if (!backend) {
+    const auto m = FileBackend::read_metadata(volume_path(cfg->volume_id));
+    if (!m || m->volume_id != cfg->volume_id || m->owner_vm != request.vm_id) {
         return oar::Status::failed;
     }
-    const VolumeMetadata& m = (*backend)->metadata();
-    if (m.volume_id != cfg->volume_id || m.owner_vm != request.vm_id) {
-        return oar::Status::failed;
+    std::unique_ptr<BlockBackend> backend;
+    LazyImageBackend* image = nullptr;
+    if (m->image) {
+        auto lazy = open_image_volume(*m);
+        if (!lazy) {
+            return oar::Status::failed;
+        }
+        image = lazy->get();
+        backend = std::move(*lazy);
+    } else {
+        auto file = FileBackend::open(volume_path(cfg->volume_id));
+        // The file was read just now; refuse one that changed underneath.
+        if (!file || (*file)->metadata() != *m) {
+            return oar::Status::failed;
+        }
+        backend = std::move(*file);
     }
-    const VolumeGeometry g{.capacity_sectors = m.capacity_sectors,
-                           .logical_block_size = m.logical_block_size,
+    const VolumeGeometry g{.capacity_sectors = m->capacity_sectors,
+                           .logical_block_size = m->logical_block_size,
                            .read_only = false,
                            .seg_max = _config.seg_max,
                            .max_transfer_bytes = _config.max_transfer_bytes};
     const std::string serial = volume_serial(cfg->volume_id);
     auto f = VirtioBlkFunction::create(params(g, serial), s->transport->memory(),
-                                       s->transport->interrupts(), std::move(*backend));
+                                       s->transport->interrupts(), std::move(backend));
     if (!f) {
         return oar::Status::failed;
     }
     // Until helm's key arrives (after the VMM opened the function), the
     // guest's requests wait in the rings.
     (*f)->await_key();
-    if (auto ok = s->transport->serve((*f)->pci(), on_flr(**f)); !ok) {
+    if (auto ok = s->transport->serve((*f)->pci(), on_flr(**f, image)); !ok) {
         // Back to the placeholder; if even that fails the transport is lost.
         static_cast<void>(s->transport->serve(s->placeholder->pci(), on_flr(*s->placeholder)));
         return oar::Status::failed;
     }
     s->active = std::move(*f);
     s->volume = cfg->volume_id;
+    s->image = image;
     return oar::Status::ok;
 }
 
@@ -221,6 +294,13 @@ auto BlkRole::deliver_key(const oar::DeliverKey& request) -> oar::Status {
     if (!ok) {
         return ok.error() == KeyError::occupied ? oar::Status::busy : oar::Status::failed;
     }
+    // An image volume's backend re-encrypts image blocks under the same
+    // (ephemeral) key. Both hold it or neither does.
+    if (s->image != nullptr && !s->image->load_keys(request.key, std::nullopt)) {
+        s->active->drop_key();
+        s->image->drop_keys();
+        return oar::Status::failed;
+    }
     return oar::Status::ok;
 }
 
@@ -234,6 +314,9 @@ auto BlkRole::drop_key(const oar::DropKey& request) -> oar::Status {
             return oar::Status::busy;
         }
         s->active->drop_key();
+        if (s->image != nullptr) {
+            s->image->drop_keys();  // and the overlay with it
+        }
     }
     return oar::Status::ok;
 }
@@ -268,10 +351,22 @@ auto BlkRole::create_volume(const oar::CreateVolume& request) -> oar::Status {
                      .owner_vm = request.owner_vm,
                      .capacity_sectors = request.capacity_sectors,
                      .logical_block_size = request.block_size,
-                     .wrapped_key = {request.wrapped_key.begin(), request.wrapped_key.end()}};
+                     .wrapped_key = {request.wrapped_key.begin(), request.wrapped_key.end()},
+                     .image = std::nullopt};
     // create() never overwrites: an existing volume file is refused.
-    return FileBackend::create(volume_path(request.volume_id), m) ? oar::Status::ok
-                                                                  : oar::Status::failed;
+    if (request.image_store == 0) {
+        return FileBackend::create(volume_path(request.volume_id), m) ? oar::Status::ok
+                                                                      : oar::Status::failed;
+    }
+    // An image volume names a store this role knows; whether the image is
+    // there is checked when the volume is attached.
+    if (_config.image_cache == nullptr || !_config.image_stores.contains(request.image_store)) {
+        return oar::Status::unsupported;
+    }
+    m.image = ImageSource{.store_id = request.image_store, .name = request.image_name};
+    return FileBackend::create_image_volume(volume_path(request.volume_id), m)
+               ? oar::Status::ok
+               : oar::Status::failed;
 }
 
 auto BlkRole::delete_volume(const oar::DeleteVolume& request) -> oar::Status {

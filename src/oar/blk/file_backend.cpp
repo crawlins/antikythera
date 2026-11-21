@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include <fcntl.h>
@@ -27,11 +28,18 @@ constexpr std::array<std::byte, 8> magic{std::byte{'A'}, std::byte{'K'}, std::by
                                          std::byte{'L'}, std::byte{'K'}, std::byte{'V'},
                                          std::byte{'O'}, std::byte{'L'}};
 constexpr std::size_t digest_size = 32;  // SHA-256
-// magic, version, key length, block size, volume, owner, capacity, key.
+// Version 1: magic, version, key length, block size, volume, owner,
+// capacity, key; then the digest.
 constexpr std::size_t fields_size = 8 + 2 + 2 + 4 + 8 + 8 + 8 + max_wrapped_key_size;
-constexpr std::size_t digest_offset = fields_size;
-constexpr std::size_t used_size = fields_size + digest_size;
-static_assert(used_size <= metadata_block_size);
+// Version 2 (image volumes) adds the image source after the key:
+// store_id u16 | reserved u16 | reserved u32 | image name [32].
+constexpr std::size_t image_fields_size = 2 + 2 + 4 + image_name_size;
+constexpr std::size_t fields_size_v2 = fields_size + image_fields_size;
+static_assert(fields_size_v2 + digest_size <= metadata_block_size);
+
+constexpr auto fields_size_of(bool image) -> std::size_t {
+    return image ? fields_size_v2 : fields_size;
+}
 
 constexpr std::uint32_t block_512 = 512;
 constexpr std::uint32_t block_4k = 4096;
@@ -61,8 +69,13 @@ auto check_fields(const VolumeMetadata& m) -> std::expected<void, MetadataError>
         m.capacity_sectors % (m.logical_block_size / sector_size) != 0) {
         return std::unexpected(MetadataError::bad_capacity);
     }
-    if (m.wrapped_key.empty() || m.wrapped_key.size() > max_wrapped_key_size) {
+    if ((m.wrapped_key.empty() && !m.image) || m.wrapped_key.size() > max_wrapped_key_size) {
         return std::unexpected(MetadataError::bad_key_length);
+    }
+    if (m.image && (m.image->store_id == 0 || std::ranges::all_of(m.image->name, [](std::byte b) {
+                        return b == std::byte{0};
+                    }))) {
+        return std::unexpected(MetadataError::bad_image_source);
     }
     return {};
 }
@@ -155,6 +168,9 @@ auto sync_parent(const std::filesystem::path& path) -> std::expected<void, int> 
 }
 
 auto file_size(const VolumeMetadata& m) -> off_t {
+    if (m.image) {
+        return static_cast<off_t>(metadata_block_size);  // the header is the whole volume file
+    }
     // check_fields bounds capacity so this cannot overflow.
     return static_cast<off_t>(volume_data_offset + (m.capacity_sectors * sector_size));
 }
@@ -181,6 +197,8 @@ auto to_string(MetadataError e) noexcept -> const char* {
             return "bad_key_length";
         case MetadataError::nonzero_padding:
             return "nonzero_padding";
+        case MetadataError::bad_image_source:
+            return "bad_image_source";
         case MetadataError::crypto_failure:
             return "crypto_failure";
     }
@@ -201,6 +219,8 @@ auto to_string(FileError e) noexcept -> const char* {
             return "size_mismatch";
         case FileError::io:
             return "io";
+        case FileError::image_volume:
+            return "image_volume";
     }
     return "unknown";
 }
@@ -209,11 +229,12 @@ auto encode_metadata(const VolumeMetadata& m) -> std::expected<Block, MetadataEr
     if (auto ok = check_fields(m); !ok) {
         return std::unexpected(ok.error());
     }
+    const std::size_t size = fields_size_of(m.image.has_value());
     std::vector<std::byte> fields;
-    fields.reserve(used_size);
+    fields.reserve(size);
     wire::Writer w{fields};
     w.bytes(magic);
-    w.le16(metadata_version);
+    w.le16(m.image ? metadata_version_image : metadata_version);
     w.le16(static_cast<std::uint16_t>(m.wrapped_key.size()));
     w.le32(m.logical_block_size);
     w.le64(m.volume_id);
@@ -221,10 +242,16 @@ auto encode_metadata(const VolumeMetadata& m) -> std::expected<Block, MetadataEr
     w.le64(m.capacity_sectors);
     w.bytes(m.wrapped_key);
     fields.resize(fields_size, std::byte{0});
+    if (m.image) {
+        w.le16(m.image->store_id);
+        w.le16(0);
+        w.le32(0);
+        w.bytes(m.image->name);
+    }
 
     Block block{};
     std::ranges::copy(fields, block.begin());
-    if (!sha256(fields, std::span{block}.subspan<digest_offset, digest_size>())) {
+    if (!sha256(fields, std::span{block}.subspan(size).first<digest_size>())) {
         return std::unexpected(MetadataError::crypto_failure);
     }
     return block;
@@ -249,39 +276,62 @@ auto decode_metadata(std::span<const std::byte> block)
     if (!version || !key_len || !lbs || !volume || !owner || !capacity || !key) {
         return std::unexpected(MetadataError::wrong_size);  // unreachable: the block is 4 KiB
     }
-    if (*version != metadata_version) {
+    if (*version != metadata_version && *version != metadata_version_image) {
         return std::unexpected(MetadataError::unsupported_version);
     }
+    const bool image = *version == metadata_version_image;
+    const std::size_t size = fields_size_of(image);
     // The digest before anything else is trusted: a corrupt header is
     // reported as corrupt, not as whichever field happened to break.
     std::array<std::byte, digest_size> digest{};
-    if (!sha256(block.first(fields_size), digest)) {
+    if (!sha256(block.first(size), digest)) {
         return std::unexpected(MetadataError::crypto_failure);
     }
-    if (!std::ranges::equal(digest, block.subspan(digest_offset, digest_size))) {
+    if (!std::ranges::equal(digest, block.subspan(size, digest_size))) {
         return std::unexpected(MetadataError::bad_digest);
     }
-    if (*key_len == 0 || *key_len > max_wrapped_key_size) {
+    if ((*key_len == 0 && !image) || *key_len > max_wrapped_key_size) {
         return std::unexpected(MetadataError::bad_key_length);
     }
     const auto is_zero = [](std::byte b) { return b == std::byte{0}; };
     if (!std::ranges::all_of(key->subspan(*key_len), is_zero) ||
-        !std::ranges::all_of(block.subspan(used_size), is_zero)) {
+        !std::ranges::all_of(block.subspan(size + digest_size), is_zero)) {
         return std::unexpected(MetadataError::nonzero_padding);
     }
     VolumeMetadata m{.volume_id = *volume,
                      .owner_vm = *owner,
                      .capacity_sectors = *capacity,
                      .logical_block_size = *lbs,
-                     .wrapped_key = {key->begin(), key->begin() + *key_len}};
+                     .wrapped_key = {key->begin(), key->begin() + *key_len},
+                     .image = std::nullopt};
+    if (image) {
+        wire::Reader x{block.subspan(fields_size, image_fields_size)};
+        const auto store = x.le16();
+        const auto rsvd16 = x.le16();
+        const auto rsvd32 = x.le32();
+        const auto name = x.bytes(image_name_size);
+        if (!store || !rsvd16 || !rsvd32 || !name) {
+            return std::unexpected(MetadataError::wrong_size);  // unreachable: the block is 4 KiB
+        }
+        if (*rsvd16 != 0 || *rsvd32 != 0) {
+            return std::unexpected(MetadataError::nonzero_padding);
+        }
+        ImageSource src{.store_id = *store, .name = {}};
+        std::ranges::copy(*name, src.name.begin());
+        m.image = src;
+    }
     if (auto ok = check_fields(m); !ok) {
         return std::unexpected(ok.error());
     }
     return m;
 }
 
-auto FileBackend::create(const std::filesystem::path& path, const VolumeMetadata& m)
-    -> std::expected<std::unique_ptr<FileBackend>, FileFailure> {
+namespace {
+
+// Writes a new volume file's header, sizes it and syncs it and its
+// directory; the open descriptor on success.
+auto write_new(const std::filesystem::path& path, const VolumeMetadata& m)
+    -> std::expected<int, FileFailure> {
     const auto block = encode_metadata(m);
     if (!block) {
         return metadata_failure(block.error());
@@ -305,7 +355,70 @@ auto FileBackend::create(const std::filesystem::path& path, const VolumeMetadata
     if (auto s = sync_parent(path); !s) {
         return abandon(s.error());
     }
+    return *fd;
+}
+
+// Reads and checks the header of the open volume file `fd`, and its size
+// against it.
+auto load_metadata(int fd) -> std::expected<VolumeMetadata, FileFailure> {
+    Block block{};
+    const auto got = pread_all(fd, block, 0);
+    if (!got) {
+        return io_failure(got.error());
+    }
+    if (*got != block.size()) {
+        return metadata_failure(MetadataError::wrong_size);
+    }
+    auto m = decode_metadata(block);
+    if (!m) {
+        return metadata_failure(m.error());
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+        return io_failure();
+    }
+    if (st.st_size != file_size(*m)) {
+        return std::unexpected(FileFailure{.error = FileError::size_mismatch});
+    }
+    return std::move(*m);
+}
+
+}  // namespace
+
+auto FileBackend::create(const std::filesystem::path& path, const VolumeMetadata& m)
+    -> std::expected<std::unique_ptr<FileBackend>, FileFailure> {
+    if (m.image) {
+        return std::unexpected(FileFailure{.error = FileError::image_volume});
+    }
+    auto fd = write_new(path, m);
+    if (!fd) {
+        return std::unexpected(fd.error());
+    }
     return std::unique_ptr<FileBackend>(new FileBackend(*fd, m));
+}
+
+auto FileBackend::create_image_volume(const std::filesystem::path& path, const VolumeMetadata& m)
+    -> std::expected<void, FileFailure> {
+    if (!m.image) {
+        return metadata_failure(MetadataError::bad_image_source);
+    }
+    auto fd = write_new(path, m);
+    if (!fd) {
+        return std::unexpected(fd.error());
+    }
+    ::close(*fd);
+    return {};
+}
+
+auto FileBackend::read_metadata(const std::filesystem::path& path)
+    -> std::expected<VolumeMetadata, FileFailure> {
+    auto fd = open_volume(path, O_RDONLY);
+    if (!fd) {
+        return std::unexpected(fd.error());
+    }
+    auto m = load_metadata(*fd);
+    ::close(*fd);
+    return m;
 }
 
 auto FileBackend::open(const std::filesystem::path& path)
@@ -314,28 +427,13 @@ auto FileBackend::open(const std::filesystem::path& path)
     if (!fd) {
         return std::unexpected(fd.error());
     }
-    auto fail = [&](std::unexpected<FileFailure> f) {
-        ::close(*fd);
-        return f;
-    };
-    Block block{};
-    const auto got = pread_all(*fd, block, 0);
-    if (!got) {
-        return fail(io_failure(got.error()));
+    auto m = load_metadata(*fd);
+    if (m && m->image) {
+        m = std::unexpected(FileFailure{.error = FileError::image_volume});
     }
-    if (*got != block.size()) {
-        return fail(metadata_failure(MetadataError::wrong_size));
-    }
-    auto m = decode_metadata(block);
     if (!m) {
-        return fail(metadata_failure(m.error()));
-    }
-    struct stat st{};
-    if (::fstat(*fd, &st) != 0) {
-        return fail(io_failure());
-    }
-    if (st.st_size != file_size(*m)) {
-        return fail(std::unexpected(FileFailure{.error = FileError::size_mismatch}));
+        ::close(*fd);
+        return std::unexpected(m.error());
     }
     return std::unique_ptr<FileBackend>(new FileBackend(*fd, std::move(*m)));
 }

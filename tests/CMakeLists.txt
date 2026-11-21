@@ -56,6 +56,7 @@ ak_add_test(image_pack_test          SOURCES image_pack_test.cpp          LIBS a
 ak_add_test(sigv4_test               SOURCES sigv4_test.cpp               LIBS ak::oar_blk_s3)
 ak_add_test(http_response_test       SOURCES http_response_test.cpp       LIBS ak::oar_blk_s3)
 ak_add_test(s3_object_store_test     SOURCES s3_object_store_test.cpp     LIBS ak::oar_blk_s3)
+ak_add_test(image_store_config_test  SOURCES image_store_config_test.cpp  LIBS ak::oar_blk_s3)
 ak_add_test(mailbox_test      SOURCES mailbox_test.cpp      LIBS ak::helm)
 ak_add_test(mailbox_device_test SOURCES mailbox_device_test.cpp LIBS ak::helm)
 ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)

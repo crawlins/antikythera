@@ -257,8 +257,10 @@ BOOST_AUTO_TEST_CASE(create_volume_layout_and_round_trip) {
     BOOST_TEST(back->wrapped_key.data() == body->data() + oar::create_volume_head_size);
 
     auto b = *body;
+    // Offset 30 is the image store: set, the next 32 bytes are an image name
+    // and the key that follows is too short for its length.
     b[create_reserved_offset] = std::byte{1};
-    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::reserved_not_zero));
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_key_length));
     b = *body;
     b.push_back(std::byte{0});
     BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_key_length));
@@ -296,6 +298,61 @@ BOOST_AUTO_TEST_CASE(create_volume_rules) {
     BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_key_length));
     c.wrapped_key = too_long;
     BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_key_length));
+}
+
+BOOST_AUTO_TEST_CASE(create_image_volume_layout_and_rules) {
+    oar::ImageName name{};
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        name[i] = static_cast<std::byte>(0xA0 + i);
+    }
+    // A plain image: no key, the name right after the head.
+    const oar::CreateVolume c{.volume_id = sample_volume,
+                              .owner_vm = sample_vm,
+                              .capacity_sectors = sample_sectors,
+                              .block_size = oar::sector_size,
+                              .wrapped_key = {},
+                              .image_store = 3,
+                              .image_name = name};
+    auto body = oar::encode_create_volume(c);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::create_volume_head_size + oar::image_name_size);
+    BOOST_TEST(std::to_integer<int>((*body)[create_reserved_offset]) == 3);
+    BOOST_TEST(std::to_integer<int>((*body)[key_len_offset]) == 0);
+    BOOST_TEST(std::ranges::equal(std::span{*body}.subspan(oar::create_volume_head_size), name));
+    auto back = oar::decode_create_volume(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->image_store == 3);
+    BOOST_TEST((back->image_name == name));
+    BOOST_TEST(back->wrapped_key.empty());
+
+    // An encrypted image's volume carries its wrapped image key after the name.
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    auto e = c;
+    e.wrapped_key = wrapped;
+    body = oar::encode_create_volume(e);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::create_volume_head_size + oar::image_name_size + wrapped_size);
+    back = oar::decode_create_volume(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(std::ranges::equal(back->wrapped_key, wrapped));
+    BOOST_TEST((back->image_name == name));
+
+    auto b = oar::encode_create_volume(c).value();
+    b.push_back(std::byte{0});  // nothing may follow a plain image's name
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_key_length));
+    b = oar::encode_create_volume(c).value();
+    b.pop_back();
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::truncated));
+    b = oar::encode_create_volume(c).value();
+    std::ranges::fill(std::span{b}.subspan(oar::create_volume_head_size), std::byte{0});
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_image));
+
+    auto bad = c;
+    bad.image_name = {};
+    BOOST_TEST((oar::encode_create_volume(bad).error() == BodyError::bad_image));
+    bad = c;
+    bad.image_store = 0;  // a disk volume names no image
+    BOOST_TEST((oar::encode_create_volume(bad).error() == BodyError::bad_image));
 }
 
 BOOST_AUTO_TEST_CASE(delete_and_rewrap_volume) {
