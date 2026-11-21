@@ -71,6 +71,10 @@ enum class DecodeError : std::uint8_t {
     bad_attachment_mode,      // more than one read-write attachment without multi_attach
     bad_qos,                  // a QoS limit of 0, or a burst below its baseline
     bad_source,               // a volume source whose fields do not fit its kind
+    bad_header_crc,           // a hold frame header whose CRC32C does not match
+    bad_block_range,          // a block count or LBA range a hold opcode does not allow
+    bad_payload_size,         // a hold payload whose length does not fit its opcode
+    bad_hold_direction,       // a hold flag or status that does not fit the opcode's direction
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -155,6 +159,14 @@ enum class DecodeError : std::uint8_t {
             return "QoS limit 0 or burst below baseline";
         case DecodeError::bad_source:
             return "volume source fields do not fit its kind";
+        case DecodeError::bad_header_crc:
+            return "hold header checksum mismatch";
+        case DecodeError::bad_block_range:
+            return "block range not allowed for the hold opcode";
+        case DecodeError::bad_payload_size:
+            return "hold payload length does not fit its opcode";
+        case DecodeError::bad_hold_direction:
+            return "hold flags or status do not fit the opcode";
     }
     return "unknown";
 }
