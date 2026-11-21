@@ -48,6 +48,7 @@ media and gives crypto-erase.
 | **hull** | The minimal host image and its agent |
 | **helm** | The control-plane role (mailbox, keys, policy, device pool) |
 | **oar** | A data-plane role (`oar-net`, `oar-blk`, later `oar-gpu`) |
+| **hold** | The storage-server role that keeps replicated network volumes |
 | **harbor** | The virt-on-virt prototype environment |
 
 ## Order of work

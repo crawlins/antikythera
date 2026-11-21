@@ -15,6 +15,7 @@ antikythera/
 │   ├── common/            ak::wire and other role-independent helpers
 │   ├── helm/              control-plane role (ak::helm)
 │   ├── hull/              host agent (ak::hull)                    [planned]
+│   ├── hold/              network volume storage role (ak::hold)   [designed]
 │   ├── oar/
 │   │   ├── net/           network data plane (ak::oar::net)
 │   │   ├── blk/           storage data plane (ak::oar::blk)

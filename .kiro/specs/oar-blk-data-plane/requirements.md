@@ -19,7 +19,8 @@ NVMe** with per-namespace locking behind a storage manager VM (later).
 ### What this spec does not cover
 
 - Guest-side encryption (explicitly not wanted: the guest must not decrypt).
-- Snapshots, replication and live migration of volumes.
+- Snapshots, replication and moving volumes between servers: network
+  volumes in `block-volume-service` cover these.
 - The key hierarchy itself (`helm-control-plane` Requirement 4).
 
 ## Glossary
