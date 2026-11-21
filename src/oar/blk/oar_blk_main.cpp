@@ -349,13 +349,16 @@ auto main(int argc, char** argv) -> int {
 
     bool more = false;
     for (;;) {
-        // [0] the sideband (or its listener), then one entry per function.
-        std::vector<pollfd> fds(1 + transports.size());
+        // [0] the sideband (or its listener), then one entry per function,
+        // then the role's waker (an image chunk arrived for a parked read;
+        // the role->poll() below serves it).
+        std::vector<pollfd> fds(2 + transports.size());
         fds[0] = {
             .fd = sideband ? sideband->fd() : (*listener)->fd(), .events = POLLIN, .revents = 0};
         for (std::size_t i = 0; i < transports.size(); ++i) {
             fds[i + 1] = {.fd = transports[i]->binding().poll_fd(), .events = POLLIN, .revents = 0};
         }
+        fds.back() = {.fd = (*role)->wake_fd(), .events = POLLIN, .revents = 0};
         if (::poll(fds.data(), fds.size(), more ? poll_now : poll_forever) < 0) {
             if (errno == EINTR) {
                 continue;

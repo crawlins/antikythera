@@ -32,24 +32,39 @@
 // ended, or in the next chunk, doubles a window of chunks to prefetch, up
 // to max_readahead_chunks; any other read resets it.
 //
-// A miss blocks the caller until the fetcher has the chunk or gives up at
-// its deadline (Requirement 8.10): the role thread waits, which asynchronous
-// completion in VirtioBlkFunction removes later (oar-blk task 14).
+// Misses (Requirement 8.10). With a Waker, read_ready() is how a read
+// avoids waiting: it answers false while a chunk the range needs is
+// neither cached nor here, after starting an asynchronous demand fetch for
+// it, and the fetcher's callback queues the result and signals the waker.
+// The function parks the request meanwhile and serves it once read_ready()
+// says yes; the role thread never waits on the store. Arrived chunks are
+// also kept here (the most recent few), so a read that follows finds them
+// even if the cache had no room; a failed fetch is remembered until the
+// read that waited for it fails with it. Without a waker, or for a read
+// that comes without asking, a miss blocks the caller until the fetcher
+// has the chunk or gives up at its deadline.
 //
 // Not thread-safe: the role thread owns it.
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <span>
+#include <utility>
+#include <vector>
 
 #include "oar/blk/chunk_cache.hpp"
 #include "oar/blk/fetcher.hpp"
 #include "oar/blk/overlay.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
+#include "oar/blk/waker.hpp"
 #include "oar/blk/xts_cipher.hpp"
 
 namespace ak::oar::blk {
@@ -65,6 +80,8 @@ struct LazyImageParams {
     std::uint32_t logical_block_size{512};
     std::uint64_t overlay_limit_bytes{0};  // 0: up to the capacity
     std::uint32_t max_readahead_chunks{8};
+    // Signalled when an asynchronous fetch finishes; none: misses block.
+    std::shared_ptr<Waker> waker;
 };
 
 enum class LazyImageError : std::uint8_t {
@@ -89,7 +106,9 @@ struct LazyImageCounters {
     std::uint64_t image_reads{0};    // blocks served from the image (cache, fetch or hole)
     std::uint64_t zero_reads{0};     // blocks past the end of the image
     std::uint64_t cache_hits{0};     // chunk pieces found in the cache
-    std::uint64_t fetches{0};        // demand fetches
+    std::uint64_t fetches{0};        // demand fetches that blocked the caller
+    std::uint64_t async_fetches{0};  // demand fetches started by read_ready()
+    std::uint64_t arrived_hits{0};   // chunk pieces served from the arrived chunks
     std::uint64_t fetch_failures{0};
     std::uint64_t readahead{0};  // chunks handed to prefetch
     std::uint64_t writes{0};
@@ -124,6 +143,7 @@ public:
         -> std::expected<void, BackendError> override;
     [[nodiscard]] auto write(std::uint64_t offset, std::span<const std::byte> in)
         -> std::expected<void, BackendError> override;
+    [[nodiscard]] auto read_ready(std::uint64_t offset, std::size_t len) -> bool override;
     // The overlay does not outlive the attachment: nothing to make durable.
     [[nodiscard]] auto flush() -> std::expected<void, BackendError> override { return {}; }
 
@@ -134,8 +154,24 @@ private:
         zero,
     };
 
-    LazyImageBackend(LazyImageParams params, std::unique_ptr<Overlay> overlay) noexcept
-        : _params{std::move(params)}, _overlay{std::move(overlay)} {}
+    // Results of asynchronous fetches, handed from fetcher workers to the
+    // role thread. Shared with the callbacks, so a fetch that finishes
+    // after the backend is gone has somewhere harmless to land.
+    struct Inbox {
+        std::mutex mutex;
+        std::vector<std::pair<std::uint32_t, FetchResult>> results;
+        std::shared_ptr<Waker> waker;
+    };
+
+    // Arrived chunks kept beyond the cache.
+    static constexpr std::size_t max_arrived = 16;
+
+    LazyImageBackend(LazyImageParams params, std::unique_ptr<Overlay> overlay)
+        : _params{std::move(params)},
+          _overlay{std::move(overlay)},
+          _inbox{std::make_shared<Inbox>()} {
+        _inbox->waker = _params.waker;
+    }
 
     [[nodiscard]] auto source(std::uint64_t block) const noexcept -> Source;
     [[nodiscard]] auto check(std::uint64_t offset, std::size_t len) const noexcept -> bool;
@@ -143,6 +179,11 @@ private:
     [[nodiscard]] auto read_image(std::uint64_t offset, std::span<std::byte> out)
         -> std::expected<void, BackendError>;
     auto readahead(std::uint64_t offset, std::uint64_t end) -> void;
+    // Moves finished asynchronous fetches out of the inbox.
+    auto collect() -> void;
+    // Whether the chunk's bytes can be had without waiting; if not, makes
+    // sure an asynchronous fetch for it is under way.
+    auto chunk_ready(std::uint32_t chunk) -> bool;
 
     LazyImageParams _params;
     std::unique_ptr<Overlay> _overlay;
@@ -150,6 +191,10 @@ private:
     std::optional<XtsCipher> _img;
     std::optional<std::uint64_t> _last_end;  // end of the previous read
     std::uint32_t _window{0};
+    std::shared_ptr<Inbox> _inbox;
+    std::set<std::uint32_t> _awaited;                           // asynchronous fetches under way
+    std::deque<std::pair<std::uint32_t, ChunkBytes>> _arrived;  // newest last
+    std::map<std::uint32_t, FetchError> _failed;
     LazyImageCounters _counters;
 };
 

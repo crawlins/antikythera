@@ -14,10 +14,13 @@
 #define BOOST_TEST_MODULE image_volume_test
 #include <boost/test/unit_test.hpp>
 
+#include <poll.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -40,6 +43,7 @@
 #include "oar/blk/object_store.hpp"
 #include "oar/blk/overlay.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
+#include "oar/blk/waker.hpp"
 #include "oar/blk/xts_cipher.hpp"
 #include "test_support.hpp"
 #include "virtio_driver_support.hpp"
@@ -77,6 +81,7 @@ namespace {
 
 constexpr std::uint64_t chunk_bytes = 64ULL * 1024;  // chunk shift 16
 constexpr std::size_t half_key = 32;
+constexpr int wake_wait_ms = 2000;
 
 // A store in memory that counts requests and fails on demand.
 class MemoryStore final : public blk::ObjectStore {
@@ -270,14 +275,16 @@ struct Rig {
     }
 
     auto backend(std::uint64_t capacity, std::uint64_t overlay_limit = 0,
-                 std::uint32_t readahead = 0) -> std::unique_ptr<blk::LazyImageBackend> {
+                 std::uint32_t readahead = 0, std::shared_ptr<blk::Waker> waker = nullptr)
+        -> std::unique_ptr<blk::LazyImageBackend> {
         auto b = blk::LazyImageBackend::create({.image = cached,
                                                 .fetcher = fetcher.get(),
                                                 .overlay_dir = dir.path(),
                                                 .capacity_bytes = capacity,
                                                 .logical_block_size = 512,
                                                 .overlay_limit_bytes = overlay_limit,
-                                                .max_readahead_chunks = readahead});
+                                                .max_readahead_chunks = readahead,
+                                                .waker = std::move(waker)});
         BOOST_REQUIRE(b.has_value());
         return std::move(*b);
     }
@@ -307,6 +314,34 @@ auto slice(const std::vector<std::byte>& v, std::uint64_t from, std::uint64_t le
     return {v.begin() + static_cast<std::ptrdiff_t>(from),
             v.begin() + static_cast<std::ptrdiff_t>(from + len)};
 }
+
+// Waits for the waker as the role's loop does; false after two seconds.
+auto woken(const blk::Waker& waker) -> bool {
+    pollfd p{.fd = waker.fd(), .events = POLLIN, .revents = 0};
+    return ::poll(&p, 1, wake_wait_ms) == 1;
+}
+
+// Collects fetch_async results from worker threads.
+class Results {
+public:
+    auto callback() -> blk::FetchCallback {
+        return [this](const blk::FetchResult& r) {
+            const std::scoped_lock lock{_mutex};
+            _results.push_back(r);
+            _arrived.notify_all();
+        };
+    }
+    auto wait(std::size_t n) -> std::vector<blk::FetchResult> {
+        std::unique_lock lock{_mutex};
+        _arrived.wait_for(lock, std::chrono::seconds{2}, [&] { return _results.size() >= n; });
+        return _results;
+    }
+
+private:
+    std::mutex _mutex;
+    std::condition_variable _arrived;
+    std::vector<blk::FetchResult> _results;
+};
 
 }  // namespace
 
@@ -369,6 +404,62 @@ BOOST_AUTO_TEST_CASE(refuses_what_cannot_fit, *boost::unit_test::timeout(unit_ti
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(fetcher)
+
+BOOST_AUTO_TEST_CASE(fetch_async_calls_back_once_per_request,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{3, 0, {1}};
+    rig.store.delay = std::chrono::milliseconds{20};
+    Results results;
+    BOOST_REQUIRE(rig.fetcher->fetch_async(rig.cached, 0, results.callback()).has_value());
+    BOOST_REQUIRE(rig.fetcher->fetch_async(rig.cached, 0, results.callback()).has_value());
+    // Holes and chunks past the image are refused at once, with no callback.
+    BOOST_TEST(rig.fetcher->fetch_async(rig.cached, 1, results.callback()).error() ==
+               FetchError::not_found);
+    BOOST_TEST(rig.fetcher->fetch_async(rig.cached, 3, results.callback()).error() ==
+               FetchError::not_found);
+    const auto got = results.wait(2);
+    BOOST_REQUIRE(got.size() == 2U);
+    for (const auto& r : got) {
+        BOOST_REQUIRE(r.has_value());
+        BOOST_TEST(((**r) == slice(rig.image.stored, 0, chunk_bytes)));
+    }
+    BOOST_TEST(rig.store.ranges() == 1U);  // one fetch, shared
+    BOOST_TEST(rig.cached->resident(0));
+    rig.fetcher->drain();
+    BOOST_TEST(results.wait(3).size() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(fetch_async_reports_failures_and_shut_down,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto config = fast_config();
+    config.workers = 1;
+    Rig rig{3, 0, {}, nullptr, 64 * chunk_bytes, config};
+    rig.store.fail_next = 1;
+    rig.store.fail_with = FetchError::denied;
+    Results failed;
+    BOOST_REQUIRE(rig.fetcher->fetch_async(rig.cached, 0, failed.callback()).has_value());
+    const auto f = failed.wait(1);
+    BOOST_REQUIRE(f.size() == 1U);
+    BOOST_TEST(f[0].error() == FetchError::denied);
+
+    // One worker busy on chunk 1; chunk 2 is still queued when the fetcher
+    // goes, and hears shut_down. Each callback runs exactly once.
+    rig.store.delay = std::chrono::milliseconds{100};
+    Results busy;
+    Results queued;
+    BOOST_REQUIRE(rig.fetcher->fetch_async(rig.cached, 1, busy.callback()).has_value());
+    while (rig.store.ranges() < 2) {
+        std::this_thread::yield();
+    }
+    BOOST_REQUIRE(rig.fetcher->fetch_async(rig.cached, 2, queued.callback()).has_value());
+    rig.fetcher.reset();
+    const auto b = busy.wait(1);
+    BOOST_REQUIRE(b.size() == 1U);
+    BOOST_TEST(b[0].has_value());
+    const auto q = queued.wait(1);
+    BOOST_REQUIRE(q.size() == 1U);
+    BOOST_TEST(q[0].error() == FetchError::shut_down);
+}
 
 BOOST_AUTO_TEST_CASE(fetches_verifies_and_caches,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -653,7 +744,10 @@ BOOST_AUTO_TEST_CASE(refuses_bad_parameters, *boost::unit_test::timeout(unit_tim
                                               .fetcher = rig.fetcher.get(),
                                               .overlay_dir = rig.dir.path(),
                                               .capacity_bytes = capacity,
-                                              .logical_block_size = lbs});
+                                              .logical_block_size = lbs,
+                                              .overlay_limit_bytes = 0,
+                                              .max_readahead_chunks = 0,
+                                              .waker = nullptr});
     };
     BOOST_TEST(with(size - 512, 512).error() == blk::LazyImageError::bad_capacity);
     BOOST_TEST(with(size + 100, 512).error() == blk::LazyImageError::bad_capacity);
@@ -662,12 +756,20 @@ BOOST_AUTO_TEST_CASE(refuses_bad_parameters, *boost::unit_test::timeout(unit_tim
     BOOST_TEST(blk::LazyImageBackend::create({.image = nullptr,
                                               .fetcher = rig.fetcher.get(),
                                               .overlay_dir = rig.dir.path(),
-                                              .capacity_bytes = size})
+                                              .capacity_bytes = size,
+                                              .logical_block_size = 512,
+                                              .overlay_limit_bytes = 0,
+                                              .max_readahead_chunks = 0,
+                                              .waker = nullptr})
                    .error() == blk::LazyImageError::no_image);
     auto bad_dir = blk::LazyImageBackend::create({.image = rig.cached,
                                                   .fetcher = rig.fetcher.get(),
                                                   .overlay_dir = rig.dir.path() / "missing",
-                                                  .capacity_bytes = size});
+                                                  .capacity_bytes = size,
+                                                  .logical_block_size = 512,
+                                                  .overlay_limit_bytes = 0,
+                                                  .max_readahead_chunks = 0,
+                                                  .waker = nullptr});
     BOOST_TEST(bad_dir.error() == blk::LazyImageError::overlay);
 }
 
@@ -682,6 +784,90 @@ BOOST_AUTO_TEST_CASE(fetch_failures_fail_the_read,
     BOOST_TEST(b->read(0, out).error() == blk::BackendError::io);
     BOOST_TEST(b->counters().fetch_failures == 1U);
     BOOST_TEST(b->read(0, out).has_value());  // a later read retries
+}
+
+// With a waker, read_ready() starts the fetches a read needs and says no
+// until they are here, so the role thread never waits on the store.
+BOOST_AUTO_TEST_CASE(read_ready_fetches_without_blocking,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{4, 0, {2}};
+    rig.store.delay = std::chrono::milliseconds{20};
+    const auto waker = blk::Waker::create();
+    BOOST_REQUIRE(waker != nullptr);
+    const std::uint64_t image = rig.image.plain.size();
+    auto b = rig.backend(image + 4096, 0, 0, waker);
+    const auto key = make_key(3);
+    BOOST_TEST(b->read_ready(0, 512));  // no key: read() fails at once
+    BOOST_REQUIRE(b->load_keys(key, std::nullopt).has_value());
+
+    // Holes, the overlay and the zeros past the image never wait.
+    BOOST_TEST(b->read_ready(2 * chunk_bytes, 4096));
+    BOOST_TEST(b->read_ready(image, 4096));
+    const std::vector<std::byte> mine(512, std::byte{0x44});
+    BOOST_REQUIRE(b->write(512, encrypt_for(mine, 512, key)).has_value());
+    BOOST_TEST(b->read_ready(512, 512));
+    BOOST_TEST(b->counters().async_fetches == 0U);
+
+    // A range over chunks 0 and 1 starts both fetches, once.
+    const std::uint64_t at = chunk_bytes - 1024;
+    BOOST_TEST(!b->read_ready(at, 2048));
+    BOOST_TEST(!b->read_ready(at, 2048));
+    BOOST_TEST(b->counters().async_fetches == 2U);
+    for (int i = 0; i < 2 && !b->read_ready(at, 2048); ++i) {
+        BOOST_REQUIRE(woken(*waker));
+        static_cast<void>(waker->drain());
+    }
+    BOOST_TEST(b->read_ready(at, 2048));
+    std::vector<std::byte> out(2048);
+    BOOST_REQUIRE(b->read(at, out).has_value());
+    BOOST_TEST((guest_view(out, at, key) == slice(rig.image.plain, at, out.size())));
+    BOOST_TEST(b->counters().fetches == 0U);  // nothing blocked
+    BOOST_TEST(rig.store.ranges() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(a_failed_fetch_fails_the_read_that_waited,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{2};
+    const auto waker = blk::Waker::create();
+    BOOST_REQUIRE(waker != nullptr);
+    auto b = rig.backend(rig.image.plain.size(), 0, 0, waker);
+    BOOST_REQUIRE(b->load_keys(make_key(9), std::nullopt).has_value());
+    rig.store.fail_next = 1;
+    rig.store.fail_with = FetchError::not_found;
+    BOOST_TEST(!b->read_ready(0, 512));
+    BOOST_REQUIRE(woken(*waker));
+    static_cast<void>(waker->drain());
+    BOOST_TEST(b->read_ready(0, 512));  // ready to fail, not to wait again
+    std::vector<std::byte> out(512);
+    BOOST_TEST(b->read(0, out).error() == blk::BackendError::io);
+    BOOST_TEST(rig.store.ranges() == 1U);
+    BOOST_TEST(b->counters().fetch_failures == 1U);
+    // The next read tries again.
+    BOOST_TEST(!b->read_ready(0, 512));
+    BOOST_REQUIRE(woken(*waker));
+    static_cast<void>(waker->drain());
+    BOOST_TEST(b->read_ready(0, 512));
+    BOOST_TEST(b->read(0, out).has_value());
+}
+
+// The arrived chunk serves the read even when the cache could not keep it.
+BOOST_AUTO_TEST_CASE(arrived_chunks_outlive_a_full_cache,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{2, 0, {}, nullptr, chunk_bytes / 2};
+    const auto waker = blk::Waker::create();
+    BOOST_REQUIRE(waker != nullptr);
+    auto b = rig.backend(rig.image.plain.size(), 0, 0, waker);
+    const auto key = make_key(5);
+    BOOST_REQUIRE(b->load_keys(key, std::nullopt).has_value());
+    BOOST_TEST(!b->read_ready(chunk_bytes, 4096));
+    BOOST_REQUIRE(woken(*waker));
+    BOOST_TEST(b->read_ready(chunk_bytes, 4096));
+    BOOST_TEST(!rig.cached->resident(1));
+    std::vector<std::byte> out(4096);
+    BOOST_REQUIRE(b->read(chunk_bytes, out).has_value());
+    BOOST_TEST((guest_view(out, chunk_bytes, key) == slice(rig.image.plain, chunk_bytes, 4096)));
+    BOOST_TEST(b->counters().arrived_hits == 1U);
+    BOOST_TEST(rig.store.ranges() == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(sequential_reads_fetch_ahead,

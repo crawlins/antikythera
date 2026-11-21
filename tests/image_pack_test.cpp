@@ -216,7 +216,8 @@ auto read_back(const std::vector<std::byte>& raw, const blk::PackOptions& option
                                                   .capacity_bytes = raw.size(),
                                                   .logical_block_size = 512,
                                                   .overlay_limit_bytes = 0,
-                                                  .max_readahead_chunks = 2});
+                                                  .max_readahead_chunks = 2,
+                                                  .waker = nullptr});
     BOOST_REQUIRE(backend.has_value());
     const auto eph = make_key(0x40);
     BOOST_REQUIRE((*backend)->load_keys(eph, image_key).has_value());

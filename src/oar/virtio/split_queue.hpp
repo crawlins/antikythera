@@ -113,6 +113,13 @@ public:
     // Next available chain, or nullopt when the driver has posted nothing new.
     [[nodiscard]] auto pop() -> std::expected<std::optional<Chain>, QueueError>;
 
+    // A popped chain again, translated afresh, for a device that kept only
+    // the head of a request it could not finish at once (spans do not
+    // survive between calls: memory_changing may unmap them). The chain is
+    // checked as on pop(); a structural error latches the queue broken. The
+    // head must be in flight, else unknown_head (a device bug, not latched).
+    [[nodiscard]] auto rewalk(std::uint16_t head) -> std::expected<Chain, QueueError>;
+
     // Returns a popped chain to the driver with `written` bytes filled in.
     [[nodiscard]] auto push(std::uint16_t head, std::uint32_t written)
         -> std::expected<void, QueueError>;

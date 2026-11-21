@@ -25,7 +25,8 @@
   SEG_MAX, BLK_SIZE, FLUSH, RO when read-only and MQ with several queues;
   `size_max` is `max_transfer_bytes / seg_max` (at least one page), so no
   request a driver builds exceeds the parser's transfer cap. Requests are
-  served synchronously from a per-queue bounce buffer: writes copy guest
+  served from a per-queue bounce buffer (a read the backend cannot serve
+  without waiting is parked first; see "Asynchronous misses"): writes copy guest
   plaintext once, encrypt in place and hand only ciphertext to the
   backend; reads decrypt in place, copy out and wipe. Without a key IN and
   OUT fail with IOERR. FLR (`function_reset`) and helm's `drop_key` wipe
@@ -194,7 +195,8 @@ role's credentials can stay read-only (8.9).
   one fetch in flight and every waiter shares it. Each fetch has a
   deadline (default 5 s) and up to 3 retries with jittered backoff on
   connection errors and 5xx; a digest mismatch is not retried against the
-  same response but counts as a failed attempt.
+  same response but counts as a failed attempt. `fetch()` waits for the
+  chunk; `fetch_async()` calls back on a worker instead.
 - **ChunkCache** — one per image name, shared by every volume of that
   image in the role: a sparse `O_TMPFILE` in the cache directory, an
   in-memory index of resident chunks, and one byte budget for all images
@@ -224,15 +226,42 @@ role's credentials can stay read-only (8.9).
   `drop_key` for its K_eph copy (and K_img), counters (hits, misses,
   fetched bytes, readahead hits, overlay blocks).
 
-### Blocking on a miss
+### Asynchronous misses
 
-The role serves requests synchronously on one thread, so a demand miss
-blocks every function of the role until the chunk arrives or its deadline
-passes. Readahead keeps sequential boot reads mostly hitting, but a cold
-random read costs a round trip to the store. The fix is asynchronous
-completion in `VirtioBlkFunction`: park the request (as `await_key`
-already parks requests) and complete it when the fetcher calls back. That
-changes the function's request loop, so it is a separate task.
+The role serves every function on one thread, so a read that waited for
+the object store would stall every function of the role until the chunk
+arrived or its deadline passed. Instead a miss parks the request:
+
+- **BlockBackend::read_ready(offset, len).** Before an IN (with a key
+  held), `VirtioBlkFunction` asks whether the read can finish without
+  waiting. A disk volume always says yes. `LazyImageBackend` says no while
+  a chunk the range needs (not in the overlay, not a hole, not past the
+  image) is neither cached nor here, and starts an asynchronous demand
+  fetch for each such chunk once (`Fetcher::fetch_async`).
+- **Parking.** The function keeps only the chain's head and the range,
+  leaves the chain in flight and goes on with the ring: writes, flushes,
+  GET_ID and reads that hit are served behind it. virtio-blk completes in
+  any order, and requests the guest has in flight together have no order
+  between them.
+- **Waking.** The fetch callback, on a fetcher worker, queues the result
+  in the backend's inbox (shared with the callback, so a late result
+  after the backend is gone is harmless) and signals the role's `Waker`,
+  an eventfd that ak-oar-blk polls alongside the transports. The role's
+  `poll()` drains it first, then each function asks again for its parked
+  requests and serves the ready ones: it translates the chain afresh
+  (`SplitQueue::rewalk`, since no span survives between calls) and serves
+  it as just popped, without parking it again.
+- **Arrivals and failures.** The backend keeps the last 16 arrived chunks
+  beside the cache, so the read that waited finds its chunk even if the
+  cache had no room. A failed fetch makes the read that waited for it
+  fail with IOERR at once, rather than wait out a second deadline; the
+  next read tries again.
+- **Teardown.** Dropping the queues (driver reset, FLR, DEVICE_NEEDS_RESET)
+  forgets parked requests with their rings. Dropping the key leaves them
+  parked; they fail with IOERR when served.
+
+A read that comes without asking, or a backend without a waker, still
+blocks on a miss up to the fetch deadline, as before.
 
 ### Lifecycle with helm
 

@@ -4,6 +4,7 @@
 #include "oar/blk/virtio_blk_function.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -231,6 +232,9 @@ auto VirtioBlkFunction::queue_notified(std::uint16_t index) -> void {
 auto VirtioBlkFunction::poll() -> bool {
     bool more = false;
     for (std::size_t i = 0; i < _queues.size(); ++i) {
+        if (!_queues[i].parked.empty()) {
+            resume(static_cast<std::uint16_t>(i));
+        }
         if (_queues[i].pending) {
             // num_queues is a u16, so every index fits.
             _queues[i].pending = process(static_cast<std::uint16_t>(i));
@@ -243,6 +247,7 @@ auto VirtioBlkFunction::poll() -> bool {
 auto VirtioBlkFunction::queues_dropped() -> void {
     for (auto& q : _queues) {
         q.pending = false;
+        q.parked.clear();  // their heads went with the rings
     }
 }
 
@@ -347,8 +352,8 @@ auto VirtioBlkFunction::process(std::uint16_t index) -> bool {
             return false;
         }
         const virtio::Chain& chain = **next;
-        const auto written = serve(q, chain);
-        if (!written || !ring->push(chain.head, *written)) {
+        const auto served = serve(q, chain, true);
+        if (!served || (!served->parked && !ring->push(chain.head, served->written))) {
             queue_error();
             return false;
         }
@@ -357,8 +362,43 @@ auto VirtioBlkFunction::process(std::uint16_t index) -> bool {
     return false;
 }
 
-auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain)
-    -> std::optional<std::uint32_t> {
+auto VirtioBlkFunction::resume(std::uint16_t index) -> void {
+    virtio::SplitQueue* ring = _pci->queue(index);
+    Queue& q = _queues[index];
+    if (ring == nullptr) {
+        q.parked.clear();
+        return;
+    }
+    bool pushed = false;
+    for (std::size_t i = 0; i < q.parked.size();) {
+        const Parked p = q.parked[i];
+        if (!_backend->read_ready(p.offset, p.len)) {
+            ++i;
+            continue;
+        }
+        q.parked.erase(q.parked.begin() + static_cast<std::ptrdiff_t>(i));
+        ++_counters.resumed;
+        auto chain = ring->rewalk(p.head);
+        if (!chain) {
+            queue_error();
+            return;
+        }
+        // Not parked again: the request may have changed under us, and a
+        // read the backend now calls ready is served even if it waits.
+        const auto served = serve(q, *chain, false);
+        if (!served || !ring->push(chain->head, served->written)) {
+            queue_error();
+            return;
+        }
+        pushed = true;
+    }
+    if (pushed) {
+        _pci->signal(index);
+    }
+}
+
+auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain, bool may_park)
+    -> std::optional<Served> {
     auto parsed = _parser.parse(chain.readable, chain.writable);
     std::uint32_t data_written = 0;
     Status st = Status::ok;
@@ -373,6 +413,13 @@ auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain)
     } else {
         const Request& req = *parsed;
         status_byte = req.status;
+        if (may_park && req.type == RequestType::in && q.cipher &&
+            !_backend->read_ready(req.sector * sector_size, req.data_bytes)) {
+            q.parked.push_back(
+                {.head = chain.head, .offset = req.sector * sector_size, .len = req.data_bytes});
+            ++_counters.parked;
+            return Served{.parked = true, .written = 0};
+        }
         switch (req.type) {
             case RequestType::in:
             case RequestType::out:
@@ -406,7 +453,8 @@ auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain)
             break;
     }
     // Bytes written into the chain: the data (IN, GET_ID) and the status.
-    return data_written + static_cast<std::uint32_t>(status_size);
+    return Served{.parked = false,
+                  .written = data_written + static_cast<std::uint32_t>(status_size)};
 }
 
 auto VirtioBlkFunction::do_io(Queue& q, const Request& req) -> Status {

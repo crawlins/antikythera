@@ -21,8 +21,9 @@
 // queue. size_max is max_transfer_bytes / seg_max, so no request the driver
 // can build exceeds the transfer cap the parser enforces.
 //
-// Requests are served synchronously in queue_notified(), up to a budget per
-// call; the rest wait for poll(). Each one goes through RequestParser
+// Requests are served in queue_notified(), up to a budget per call; the
+// rest wait for poll(). A read the backend cannot serve without waiting is
+// parked (below). Each one goes through RequestParser
 // (bounds, shape, range) before any I/O, then:
 //
 //   OUT    guest plaintext is copied once into the queue's bounce buffer,
@@ -32,6 +33,19 @@
 //          copied out to the guest, and the bounce buffer is wiped;
 //   FLUSH  forwarded to the backend;
 //   GET_ID the attachment's serial, zero-padded to 20 bytes.
+//
+// Parking (oar-blk Requirement 8.10, design "Asynchronous misses"). Before
+// an IN with a key held, the function asks the backend whether the read is
+// ready (BlockBackend::read_ready). If not, it parks the request: it keeps
+// only the head and the range, leaves the chain in flight, and goes on with
+// the rest of the ring, so a cold image chunk delays only the requests that
+// need it. poll() asks again for every parked request and serves the ready
+// ones, translating the chain afresh (SplitQueue::rewalk) and serving it
+// as if it had just been popped, without parking it a second time.
+// virtio-blk completes requests in any order, and a request the guest
+// issued concurrently with another has no order relative to it. Dropping
+// the queues forgets parked requests with their rings; dropping the key
+// leaves them parked, and they fail with IOERR when served.
 //
 // The XTS data unit is the logical block (512 B or 4 KiB) and its tweak is
 // the logical block number, so sector s of a 4 KiB volume is in unit s / 8
@@ -134,6 +148,14 @@ public:
     [[nodiscard]] virtual auto size_bytes() const noexcept -> std::uint64_t = 0;
     [[nodiscard]] virtual auto read(std::uint64_t offset, std::span<std::byte> out)
         -> std::expected<void, BackendError> = 0;
+    // Whether read() of this range can finish without waiting on anything
+    // slower than local storage. A backend that answers false has started
+    // what the range waits for and will signal the role's Waker when it
+    // arrives; the function parks the request and asks again then. The
+    // answer is a hint: read() must still work (perhaps slowly) either way.
+    [[nodiscard]] virtual auto read_ready(std::uint64_t /*offset*/, std::size_t /*len*/) -> bool {
+        return true;
+    }
     [[nodiscard]] virtual auto write(std::uint64_t offset, std::span<const std::byte> in)
         -> std::expected<void, BackendError> = 0;
     // Makes every completed write durable.
@@ -178,6 +200,8 @@ struct BlkCounters {
     std::uint64_t no_key{0};           // IN/OUT refused because no key is held
     std::uint64_t queue_errors{0};     // DEVICE_NEEDS_RESET raised by this device
     std::uint64_t function_resets{0};  // FLRs
+    std::uint64_t parked{0};           // reads parked until the backend was ready
+    std::uint64_t resumed{0};          // parked reads served
 };
 
 class VirtioBlkFunction final : public virtio::Device {
@@ -231,10 +255,24 @@ public:
     auto queues_dropped() -> void override;
 
 private:
+    // A read waiting for its backend: the chain stays in flight.
+    struct Parked {
+        std::uint16_t head{0};
+        std::uint64_t offset{0};
+        std::size_t len{0};
+    };
+
     struct Queue {
         std::optional<XtsCipher> cipher;
         std::vector<std::byte> bounce;  // max_transfer_bytes
         bool pending{false};            // budget ran out; poll() continues
+        std::vector<Parked> parked;
+    };
+
+    // What serving a chain came to.
+    struct Served {
+        bool parked{false};
+        std::uint32_t written{0};  // bytes written into the chain, when not parked
     };
 
     VirtioBlkFunction(const BlkParams& params, RequestParser parser, KeySlot key,
@@ -242,9 +280,11 @@ private:
 
     // Serves up to the budget; true if requests remain.
     auto process(std::uint16_t index) -> bool;
-    // Serves one chain and returns the bytes written into it, or nullopt if
-    // it cannot be completed (no status byte).
-    auto serve(Queue& q, const virtio::Chain& chain) -> std::optional<std::uint32_t>;
+    // Serves the parked requests whose backend is now ready.
+    auto resume(std::uint16_t index) -> void;
+    // Serves one chain, or parks it (only with may_park); nullopt if it
+    // cannot be completed (no status byte).
+    auto serve(Queue& q, const virtio::Chain& chain, bool may_park) -> std::optional<Served>;
     auto do_io(Queue& q, const Request& req) -> Status;
     auto do_get_id(const Request& req) -> std::uint32_t;
     auto queue_error() -> void;

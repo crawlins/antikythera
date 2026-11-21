@@ -447,6 +447,46 @@ BOOST_AUTO_TEST_CASE(push_accepts_only_popped_heads_within_capacity,
     BOOST_TEST(!q.broken());
 }
 
+// A device that parks a request keeps only its head and translates the
+// chain again later; what the driver changed meanwhile is checked afresh.
+BOOST_AUTO_TEST_CASE(rewalk_translates_an_in_flight_chain_again,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Driver d;
+    d.desc(0, data_gpa, buf_len, virtio::desc_f_next, 1);
+    d.desc(1, data_gpa + buf_len, buf_len / 2, virtio::desc_f_write);
+    d.publish(0);
+    auto q = d.queue();
+    BOOST_TEST(q.rewalk(0).error() == QueueError::unknown_head);  // not popped yet
+    const auto first = pop_chain(q);
+
+    auto again = q.rewalk(first.head);
+    BOOST_REQUIRE(again.has_value());
+    BOOST_TEST(again->head == first.head);
+    BOOST_TEST(again->readable[0].data() == d.host(data_gpa));
+    BOOST_TEST(again->writable_bytes == buf_len / 2);
+    BOOST_TEST(q.in_flight() == 1U);
+
+    // The driver grew the writable buffer: push() may fill what it holds now.
+    d.desc(1, data_gpa + buf_len, buf_len, virtio::desc_f_write);
+    again = q.rewalk(first.head);
+    BOOST_REQUIRE(again.has_value());
+    BOOST_TEST(again->writable_bytes == buf_len);
+    BOOST_REQUIRE(q.push(first.head, buf_len));
+    BOOST_TEST(q.rewalk(first.head).error() == QueueError::unknown_head);
+    BOOST_TEST(q.rewalk(queue_size).error() == QueueError::unknown_head);
+    BOOST_TEST(!q.broken());
+
+    // A chain broken while in flight breaks the queue, as on pop().
+    d.desc(2, data_gpa, buf_len, virtio::desc_f_write);
+    d.publish(2);
+    const auto second = pop_chain(q);
+    d.desc(2, data_gpa, buf_len, virtio::desc_f_write | virtio::desc_f_next, 3);
+    d.desc(3, data_gpa, buf_len, 0);  // readable after writable
+    BOOST_TEST(q.rewalk(second.head).error() == QueueError::readable_after_writable);
+    BOOST_TEST(q.broken());
+    BOOST_TEST(q.rewalk(second.head).error() == QueueError::broken);
+}
+
 // --- SplitQueue: notification suppression --------------------------------
 
 BOOST_AUTO_TEST_CASE(interrupts_follow_the_no_interrupt_flag,
