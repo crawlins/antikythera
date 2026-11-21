@@ -368,6 +368,33 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         return {};
     }
 
+    if (const auto* c = std::get_if<mailbox::CreateVolume>(&body);
+        c != nullptr && c->image_store != 0) {
+        if (_volumes.contains(c->volume_id) || _keys->owner(c->volume_id)) {
+            return std::unexpected(Status::conflict);
+        }
+        if (!_keys->find_vm_key(c->owner_vm)) {
+            return std::unexpected(Status::unknown_vm);
+        }
+        const auto slot = storage_slot();
+        if (!slot) {
+            return std::unexpected(Status::insufficient_resources);
+        }
+        auto stored = port_for(*slot)->create_volume(
+            {.volume_id = c->volume_id,
+             .owner_vm = c->owner_vm,
+             .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
+             .block_size = oar::sector_size,
+             .wrapped_key = {},
+             .image_store = c->image_store,
+             .image_name = c->image_name});
+        if (!stored) {
+            return std::unexpected(link_status(stored.error()));
+        }
+        undo.stored_volume = StoredVolume{.volume = c->volume_id, .slot = *slot};
+        return {};
+    }
+
     if (const auto* c = std::get_if<mailbox::CreateVolume>(&body)) {
         if (_volumes.contains(c->volume_id)) {
             return std::unexpected(Status::conflict);
@@ -400,7 +427,9 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
              .owner_vm = c->owner_vm,
              .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
              .block_size = oar::sector_size,
-             .wrapped_key = wrapped->key.bytes()});
+             .wrapped_key = wrapped->key.bytes(),
+             .image_store = 0,
+             .image_name = {}});
         if (!stored) {
             // Not marked for undo: a refused create (the volume exists on
             // the media, say) must not be answered by erasing it.
@@ -411,7 +440,7 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* d = std::get_if<mailbox::DeleteVolume>(&body)) {
-        if (!_keys->owner(d->volume_id)) {
+        if (!volume_owner(d->volume_id)) {
             return std::unexpected(Status::unknown_volume);
         }
         if (_attached.contains(d->volume_id)) {
@@ -421,7 +450,7 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* a = std::get_if<mailbox::AttachVolume>(&body)) {
-        const auto owner = _keys->owner(a->volume_id);
+        const auto owner = volume_owner(a->volume_id);
         if (!owner) {
             return std::unexpected(Status::unknown_volume);
         }
@@ -451,7 +480,7 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* d = std::get_if<mailbox::DetachVolume>(&body)) {
-        if (!_keys->owner(d->volume_id)) {
+        if (!volume_owner(d->volume_id)) {
             return std::unexpected(Status::unknown_volume);
         }
         const auto id = function_id(d->device);
@@ -465,6 +494,9 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* r = std::get_if<mailbox::RewrapVolume>(&body)) {
+        if (is_image_volume(r->volume_id)) {
+            return std::unexpected(Status::unsupported);  // no key to rewrap (task 15)
+        }
         const auto owner = _keys->owner(r->volume_id);
         if (!owner) {
             return std::unexpected(Status::unknown_volume);
@@ -519,8 +551,19 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
             }
         }
         std::erase_if(_attached,
-                      [&](const auto& entry) { return _keys->owner(entry.first) == d->vm_id; });
+                      [&](const auto& entry) { return volume_owner(entry.first) == d->vm_id; });
         if (!d->persist_volumes) {
+            // Image volumes have no key to erase: only their descriptors go.
+            std::vector<VolumeId> images;
+            for (const auto& [id, volume] : _volumes) {
+                if (volume.image && volume.owner == d->vm_id) {
+                    images.push_back(id);
+                }
+            }
+            for (const auto volume : images) {
+                erase_volume(volume);
+                _volumes.erase(volume);
+            }
             if (auto erased = _keys->destroy_vm_key(d->vm_id)) {
                 audit(AuditRecord::of(AuditEvent::vm_key_destroyed)
                           .with_seq(seq)
@@ -541,14 +584,19 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         _volumes[cv->volume_id] =
             Volume{.owner = cv->owner_vm,
                    .size_gib = cv->size_gib,
-                   .slot = undo.stored_volume ? undo.stored_volume->slot : std::uint8_t{0}};
+                   .slot = undo.stored_volume ? undo.stored_volume->slot : std::uint8_t{0},
+                   .image = cv->image_store != 0};
     } else if (const auto* dv = std::get_if<mailbox::DeleteVolume>(&body)) {
-        if (_keys->destroy_volume_key(dv->volume_id)) {
-            audit(AuditRecord::of(AuditEvent::volume_key_destroyed)
-                      .with_seq(seq)
-                      .with_volume(dv->volume_id));
-        } else {
-            ++_stats.inconsistencies;
+        // An image volume has nothing to crypto-erase: each attachment's
+        // key died with the attachment.
+        if (!is_image_volume(dv->volume_id)) {
+            if (_keys->destroy_volume_key(dv->volume_id)) {
+                audit(AuditRecord::of(AuditEvent::volume_key_destroyed)
+                          .with_seq(seq)
+                          .with_volume(dv->volume_id));
+            } else {
+                ++_stats.inconsistencies;
+            }
         }
         erase_volume(dv->volume_id);
         _volumes.erase(dv->volume_id);
@@ -592,7 +640,10 @@ auto CommandRouter::deliver_volume_key(std::uint64_t seq, const mailbox::AttachV
     -> void {
     const auto id = function_id(attach.device);
     auto* port = port_for(attach.device.slot);
-    auto key = _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
+    // An image volume's key exists only for this attachment.
+    auto key = is_image_volume(attach.volume_id)
+                   ? _keys->create_ephemeral_key()
+                   : _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
     bool delivered = false;
     if (port != nullptr && key) {
         delivered = port->deliver_key(attach.device.function, attach.volume_id, std::move(*key))
@@ -611,6 +662,18 @@ auto CommandRouter::deliver_volume_key(std::uint64_t seq, const mailbox::AttachV
                                                 .slot = attach.device.slot,
                                                 .detail = attach.volume_id});
     }
+}
+
+auto CommandRouter::volume_owner(VolumeId volume) const -> std::optional<VmId> {
+    if (const auto it = _volumes.find(volume); it != _volumes.end() && it->second.image) {
+        return it->second.owner;
+    }
+    return _keys->owner(volume);
+}
+
+auto CommandRouter::is_image_volume(VolumeId volume) const -> bool {
+    const auto it = _volumes.find(volume);
+    return it != _volumes.end() && it->second.image;
 }
 
 auto CommandRouter::erase_volume(VolumeId volume) -> void {

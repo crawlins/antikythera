@@ -123,6 +123,14 @@ auto KeyStore::unwrap_volume_key(VolumeId volume, VmId requester)
     return std::move(*key);
 }
 
+auto KeyStore::create_ephemeral_key() -> std::expected<ScopedKey, KeyError> {
+    auto key = _se->create_ephemeral_key();
+    if (!key) {
+        return std::unexpected(from_se(key.error()));
+    }
+    return std::move(*key);
+}
+
 auto KeyStore::rewrap(VolumeId volume, VmId new_owner) -> std::expected<void, KeyError> {
     const auto vol = _volume_keys.find(volume);
     if (vol == _volume_keys.end()) {

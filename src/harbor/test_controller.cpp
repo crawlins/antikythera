@@ -218,6 +218,23 @@ auto mac(std::string_view s) -> std::expected<proto::Mac, std::string> {
     return out;
 }
 
+auto image_name(std::string_view s) -> std::expected<mb::ImageName, std::string> {
+    mb::ImageName out{};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const auto part = s.substr(i * 2, 2);
+        std::uint8_t v = 0;
+        const auto [end, ec] = std::from_chars(part.data(), part.data() + part.size(), v, 16);
+        if (part.size() != 2 || ec != std::errc{} || end != part.data() + 2) {
+            return std::unexpected("bad image name (want 64 hex digits)");
+        }
+        out[i] = std::byte{v};
+    }
+    if (s.size() != out.size() * 2) {
+        return std::unexpected("bad image name (want 64 hex digits)");
+    }
+    return out;
+}
+
 auto vtep(std::string_view s) -> std::expected<proto::VtepAddress, std::string> {
     const std::string text{s};
     proto::VtepAddress out{};
@@ -341,6 +358,7 @@ public:
     }
     auto device() -> mb::DeviceType { return take(device_type(next())); }
     auto mac_address() -> mb::Mac { return take(mac(next())); }
+    auto image() -> mb::ImageName { return take(image_name(next())); }
     [[nodiscard]] auto more() const noexcept -> bool { return _pos < _args.size(); }
     auto detach_policy() -> mb::DetachPolicy { return take(policy(next())); }
 
@@ -431,8 +449,14 @@ constexpr std::array verbs{
              const auto vol = p.num<std::uint64_t>("volume id");
              const auto owner = p.num<std::uint64_t>("owner VM id");
              const auto size = p.num<std::uint32_t>("size");
-             return mb::CreateVolume{.volume_id = vol, .owner_vm = owner, .size_gib = size};
-         }},
+             mb::CreateVolume out{.volume_id = vol, .owner_vm = owner, .size_gib = size};
+             if (p.more()) {
+                 out.image_store = p.num<std::uint16_t>("image store");
+                 out.image_name = p.image();
+             }
+             return out;
+         },
+         2},
     Verb{"delete-volume", 1,
          [](Args& p) -> mb::Body {
              return mb::DeleteVolume{.volume_id = p.num<std::uint64_t>("volume id")};

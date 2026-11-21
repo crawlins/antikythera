@@ -30,7 +30,9 @@
 //   attach-device VM SLOT nic FN VNI NIC_ID MAC   e.g. 1 2 nic 0 0x10 0x10 02:00:00:00:00:10
 //   attach-device VM SLOT gpu|gpu-vf FN
 //   detach-device VM SLOT nic|gpu|gpu-vf FN TIMEOUT_S force|destroy-vm
-//   create-volume VOLUME OWNER_VM SIZE_GIB
+//   create-volume VOLUME OWNER_VM SIZE_GIB [STORE IMAGE_NAME]
+//                        with STORE and the image's 64-hex-digit name: an
+//                        image volume (oar-blk Requirement 8)
 //   delete-volume VOLUME
 //   attach-volume VOLUME VM SLOT FN
 //   detach-volume VOLUME VM SLOT FN TIMEOUT_S force|destroy-vm

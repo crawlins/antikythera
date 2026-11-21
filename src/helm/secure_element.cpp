@@ -74,6 +74,18 @@ auto random_fill(std::span<std::byte> out) -> std::expected<void, SeError> {
     return {};
 }
 
+}  // namespace
+
+auto SecureElement::create_ephemeral_key() -> std::expected<ScopedKey, SeError> {
+    SecretBytes<volume_key_size> key;  // wiped when it goes out of scope
+    if (auto ok = random_fill(key.span()); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return make_scoped_key(key.span());
+}
+
+namespace {
+
 // What a blob is bound to: the VM for a VM key; the volume and its owner
 // for a volume key.
 struct Identity {

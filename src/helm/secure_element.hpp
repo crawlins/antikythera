@@ -159,6 +159,11 @@ public:
                                    const WrappedVolumeKey& volume)
         -> std::expected<WrappedVolumeKey, SeError> = 0;
 
+    // Draws a fresh random volume key that is never wrapped or stored: an
+    // image volume's attachment key (oar-blk Requirement 8.6), gone once
+    // delivered. The default draws it from OpenSSL's RNG.
+    virtual auto create_ephemeral_key() -> std::expected<ScopedKey, SeError>;
+
 protected:
     SecureElement(SecureElement&&) noexcept = default;
     auto operator=(SecureElement&&) noexcept -> SecureElement& = default;

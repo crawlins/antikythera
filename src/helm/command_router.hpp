@@ -58,6 +58,16 @@
 //   REWRAP_VOLUME  commit: rewrap in the KeyStore, then rewrap_volume
 //                  writes the new owner and wrapped key to the media.
 //
+// Image volumes (oar-blk Requirement 8, task 13): CREATE_VOLUME with an
+// image source creates no volume key. The storage role gets the store ID
+// and image name instead, and the router keeps the owner itself. At
+// ATTACH_VOLUME's commit the key delivered is a fresh ephemeral one from
+// the secure element (KeyStore::create_ephemeral_key), never wrapped or
+// kept, so the overlay written under it is unreadable once the function
+// drops it. DELETE_VOLUME has no key to destroy, and DESTROY_VM without
+// persist_volumes deletes the VM's image volumes too. REWRAP_VOLUME is
+// unsupported until encrypted images give them a key to rewrap (task 15).
+//
 // A media step that fails after commit (delete or rewrap) cannot be undone
 // either: it is counted in storage_failures. A failed delete leaves only
 // ciphertext whose key is gone; a failed rewrap leaves the old wrapped key
@@ -301,6 +311,7 @@ private:
         VmId owner{0};
         std::uint32_t size_gib{0};
         std::uint8_t slot{0};  // the storage slot holding it
+        bool image{false};     // an image volume: no KeyStore entry, owner kept here
     };
 
     using Outcome = proto::CommandOutcome;
@@ -317,6 +328,9 @@ private:
     auto deliver_volume_key(std::uint64_t seq, const mailbox::AttachVolume& attach) -> void;
     // Releases a volume's space on its storage role (after crypto-erase).
     auto erase_volume(VolumeId volume) -> void;
+    // A volume's owner: the KeyStore's for a disk volume, ours for an image volume.
+    [[nodiscard]] auto volume_owner(VolumeId volume) const -> std::optional<VmId>;
+    [[nodiscard]] auto is_image_volume(VolumeId volume) const -> bool;
     [[nodiscard]] auto storage_slot() const -> std::optional<std::uint8_t>;
     auto finish(std::uint64_t seq, mailbox::Type command, mailbox::Status status,
                 std::span<const std::byte> payload = {}) -> void;
