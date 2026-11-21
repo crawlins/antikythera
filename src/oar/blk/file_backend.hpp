@@ -96,7 +96,7 @@ struct FileFailure {
     int os_error{0};                                          // errno when io
 };
 
-class FileBackend final : public BlockBackend {
+class FileBackend final : public SyncBlockBackend {
 public:
     // Creates a new volume file (never overwrites; mode 0600), writes the
     // header, sizes it sparsely to hold the whole volume and syncs it.

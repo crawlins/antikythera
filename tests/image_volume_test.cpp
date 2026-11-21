@@ -9,9 +9,13 @@
 // LazyImageBackend serves overlay, image and zero blocks as ciphertext
 // under the attachment key, fetches only what is read, reads ahead on
 // sequential reads and discards the overlay with the key, including
-// through VirtioBlkFunction as a guest sees it.
+// through VirtioBlkFunction as a guest sees it. Submitted reads that miss
+// park until Fetcher::fetch_async delivers and poll() completes them
+// (block-volume-service task 3).
 
 #define BOOST_TEST_MODULE image_volume_test
+#include <poll.h>
+
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
@@ -308,6 +312,38 @@ auto slice(const std::vector<std::byte>& v, std::uint64_t from, std::uint64_t le
             v.begin() + static_cast<std::ptrdiff_t>(from + len)};
 }
 
+constexpr int wake_wait_ms = 100;
+constexpr int max_wakes = 100;
+
+// The role's event loop in miniature: sleep on `fd`, then poll, until
+// `idle` holds.
+template<typename Poll, typename Idle> auto run_loop(int fd, Poll poll_once, Idle idle) -> void {
+    BOOST_REQUIRE(fd >= 0);
+    for (int i = 0; i < max_wakes && !idle(); ++i) {
+        pollfd p{.fd = fd, .events = POLLIN, .revents = 0};
+        static_cast<void>(::poll(&p, 1, wake_wait_ms));
+        static_cast<void>(poll_once());
+    }
+    BOOST_REQUIRE(idle());
+}
+
+auto settle(blk::LazyImageBackend& b) -> void {
+    run_loop(b.wake_fd(), [&] { return b.poll(); }, [&] { return b.parked() == 0; });
+}
+
+// A submitted read's outcome, once its completion has run.
+struct Outcome {
+    bool ran{false};
+    blk::BackendResult result;
+    auto completion() -> blk::BackendCompletion {
+        return [this](blk::BackendResult r) {
+            BOOST_TEST(!ran);  // exactly once
+            ran = true;
+            result = r;
+        };
+    }
+};
+
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(chunk_cache)
@@ -453,6 +489,57 @@ BOOST_AUTO_TEST_CASE(concurrent_demands_share_one_fetch,
     BOOST_TEST(ok.load() == 4);
     BOOST_TEST(rig.store.ranges() == 1U);
     BOOST_TEST(rig.fetcher->counters().joined == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(async_demands_join_and_report_once,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{3, 0, {2}};
+    rig.store.delay = std::chrono::milliseconds{20};
+    std::mutex m;
+    std::vector<blk::FetchResult> results;
+    auto record = [&](blk::FetchResult r) {
+        const std::scoped_lock lock{m};
+        results.push_back(std::move(r));
+    };
+    rig.fetcher->fetch_async(rig.cached, 0, record);
+    rig.fetcher->fetch_async(rig.cached, 0, record);            // joins the first
+    BOOST_TEST(rig.fetcher->fetch(rig.cached, 0).has_value());  // and so does this
+    rig.fetcher->drain();
+    {
+        const std::scoped_lock lock{m};
+        BOOST_REQUIRE(results.size() == 2U);
+        BOOST_TEST(results[0].has_value());
+        BOOST_TEST((results[0] == results[1]));  // the same bytes
+    }
+    BOOST_TEST(rig.store.ranges() == 1U);
+    // A hole fails at once, on this thread.
+    rig.fetcher->fetch_async(rig.cached, 2, record);
+    const std::scoped_lock lock{m};
+    BOOST_REQUIRE(results.size() == 3U);
+    BOOST_TEST(results[2].error() == FetchError::not_found);
+}
+
+BOOST_AUTO_TEST_CASE(shutting_down_fails_queued_async_demands,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto config = fast_config();
+    config.workers = 1;
+    Rig rig{3, 0, {}, nullptr, 64 * chunk_bytes, config};
+    rig.store.delay = std::chrono::milliseconds{50};
+    std::atomic<int> ok{0};
+    std::atomic<int> shut{0};
+    auto record = [&](const blk::FetchResult& r) {
+        if (r) {
+            ++ok;
+        } else if (r.error() == FetchError::shut_down) {
+            ++shut;
+        }
+    };
+    rig.fetcher->fetch_async(rig.cached, 0, record);
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});  // chunk 0 starts
+    rig.fetcher->fetch_async(rig.cached, 1, record);             // queued behind it
+    rig.fetcher.reset();
+    BOOST_TEST(ok.load() + shut.load() == 2);
+    BOOST_TEST(shut.load() >= 1);
 }
 
 BOOST_AUTO_TEST_CASE(prefetches_in_the_background,
@@ -758,7 +845,11 @@ BOOST_AUTO_TEST_CASE(through_the_virtio_blk_function,
         if (write) {
             ram.put_bytes(gpas[1], data);
         }
+        ram.put<std::byte>(gpas[2], std::byte{0xFF});
         BOOST_REQUIRE(driver.notify(0));
+        // A read that misses parks until the fetch lands.
+        run_loop((*fn)->wake_fd(), [&] { return (*fn)->poll(); },
+                 [&] { return (*fn)->in_flight() == 0; });
         BOOST_TEST(ram.get<std::byte>(gpas[2]) == std::byte{0});
         return ram.bytes(gpas[1], len);
     };
@@ -773,6 +864,107 @@ BOOST_AUTO_TEST_CASE(through_the_virtio_blk_function,
     // The overlay's file is the backend's; its stored bytes are not `mine`.
     BOOST_TEST(lazy->overlay().read(8 * 512, raw).has_value());
     BOOST_TEST((raw != mine));
+    BOOST_TEST(lazy->counters().parked == 1U);  // the first read's miss
+}
+
+BOOST_AUTO_TEST_CASE(submitted_misses_park_until_the_fetch_lands,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{3, 0, {1}};
+    auto b = rig.backend(rig.image.plain.size());
+    const auto key = make_key(11);
+    BOOST_REQUIRE(b->load_keys(key, std::nullopt).has_value());
+    rig.store.delay = std::chrono::milliseconds{20};
+    // Spans chunk 0, the hole and chunk 2: two fetches, one read.
+    std::vector<std::byte> out(chunk_bytes + 1024);
+    const std::uint64_t at = chunk_bytes - 512;
+    Outcome o;
+    b->submit_read(at, out, o.completion());
+    BOOST_TEST(!o.ran);
+    BOOST_TEST(b->parked() == 1U);
+    BOOST_TEST(b->counters().fetches == 2U);
+    settle(*b);
+    BOOST_REQUIRE(o.ran);
+    BOOST_REQUIRE(o.result.has_value());
+    BOOST_TEST((guest_view(out, at, key) == slice(rig.image.plain, at, out.size())));
+    BOOST_TEST(rig.store.ranges() == 2U);
+    BOOST_TEST(!b->poll());  // nothing left
+
+    // Resident now: the next submit completes inside the call.
+    Outcome again;
+    b->submit_read(at, out, again.completion());
+    BOOST_TEST(again.ran);
+    BOOST_TEST(again.result.has_value());
+    BOOST_TEST(b->counters().parked == 1U);
+    BOOST_TEST(rig.store.ranges() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(fetched_chunks_serve_the_read_without_cache_room,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // The cache holds one chunk; the read needs two.
+    Rig rig{2, 0, {}, nullptr, chunk_bytes};
+    auto b = rig.backend(rig.image.plain.size());
+    const auto key = make_key(12);
+    BOOST_REQUIRE(b->load_keys(key, std::nullopt).has_value());
+    std::vector<std::byte> out(2 * chunk_bytes);
+    Outcome o;
+    b->submit_read(0, out, o.completion());
+    settle(*b);
+    BOOST_REQUIRE(o.ran);
+    BOOST_REQUIRE(o.result.has_value());
+    BOOST_TEST((guest_view(out, 0, key) == rig.image.plain));
+    BOOST_TEST(rig.store.ranges() == 2U);  // no synchronous second fetch
+}
+
+BOOST_AUTO_TEST_CASE(a_failed_fetch_fails_the_parked_read,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{2};
+    auto b = rig.backend(rig.image.plain.size());
+    BOOST_REQUIRE(b->load_keys(make_key(13), std::nullopt).has_value());
+    rig.store.fail_next = 1;
+    rig.store.fail_with = FetchError::not_found;
+    std::vector<std::byte> out(512);
+    Outcome o;
+    b->submit_read(0, out, o.completion());
+    settle(*b);
+    BOOST_REQUIRE(o.ran);
+    BOOST_TEST(o.result.error() == blk::BackendError::io);
+    BOOST_TEST(b->counters().fetch_failures == 1U);
+    // Bad requests and missing keys still fail inside the call.
+    Outcome bad;
+    b->submit_read(100, out, bad.completion());
+    BOOST_TEST(bad.ran);
+    BOOST_TEST(bad.result.error() == blk::BackendError::out_of_range);
+}
+
+BOOST_AUTO_TEST_CASE(dropping_the_keys_fails_a_parked_read,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{2};
+    auto b = rig.backend(rig.image.plain.size());
+    BOOST_REQUIRE(b->load_keys(make_key(14), std::nullopt).has_value());
+    rig.store.delay = std::chrono::milliseconds{20};
+    std::vector<std::byte> out(512);
+    Outcome o;
+    b->submit_read(0, out, o.completion());
+    BOOST_TEST(!o.ran);
+    b->drop_keys();
+    settle(*b);
+    BOOST_REQUIRE(o.ran);
+    BOOST_TEST(o.result.error() == blk::BackendError::io);
+}
+
+BOOST_AUTO_TEST_CASE(destroying_the_backend_drops_parked_reads,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{2};
+    auto b = rig.backend(rig.image.plain.size());
+    BOOST_REQUIRE(b->load_keys(make_key(15), std::nullopt).has_value());
+    rig.store.delay = std::chrono::milliseconds{20};
+    std::vector<std::byte> out(512);
+    Outcome o;
+    b->submit_read(0, out, o.completion());
+    b.reset();
+    rig.fetcher->drain();  // the fetch lands in an inbox nobody reads
+    BOOST_TEST(!o.ran);
+    BOOST_TEST(rig.cached->resident(0));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

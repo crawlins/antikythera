@@ -6,15 +6,20 @@
 // script of BAR accesses, kicks, polls, key deliveries and resets. Checks
 // that every backend access is a whole number of logical blocks inside the
 // volume (Requirement 6.1), and that an FLR always leaves the function
-// without a key (Requirements 1.2, 2.3).
+// without a key (Requirements 1.2, 2.3). In async mode the backend parks
+// every operation until the script releases it, in any order and with
+// either outcome, so completions race resets, key drops and unmaps
+// (block-volume-service task 3).
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "oar/blk/virtio_blk_function.hpp"
@@ -43,6 +48,8 @@ constexpr std::uint8_t mode_event_idx = 0x01;
 constexpr std::uint8_t mode_indirect = 0x02;
 constexpr std::uint8_t mode_4k = 0x04;
 constexpr std::uint8_t mode_read_only = 0x08;
+constexpr std::uint8_t mode_async = 0x10;
+constexpr std::uint16_t async_in_flight = 4;
 constexpr std::uint32_t block_4k = 4096;
 constexpr std::uint32_t seg_max = 2;
 constexpr std::uint32_t max_transfer = 8192;
@@ -58,10 +65,47 @@ public:
     auto raise(std::uint16_t /*vector*/) -> void override {}
 };
 
-// Aborts on any access the function should never make.
-class CheckingBackend final : public blk::BlockBackend {
+// Aborts on any access the function should never make. Async: parks each
+// operation until release() and completes it in the next poll().
+class CheckingBackend final : public blk::SyncBlockBackend {
 public:
-    explicit CheckingBackend(std::uint32_t block) : _block{block}, _data(capacity_sectors * 512) {}
+    CheckingBackend(std::uint32_t block, bool async)
+        : _block{block}, _async{async}, _data(capacity_sectors * 512) {}
+
+    auto submit_read(std::uint64_t offset, std::span<std::byte> out, blk::BackendCompletion done)
+        -> void override {
+        check(offset, out.size());
+        park([this, offset, out] { return read(offset, out); }, std::move(done));
+    }
+    auto submit_write(std::uint64_t offset, std::span<const std::byte> in,
+                      blk::BackendCompletion done) -> void override {
+        check(offset, in.size());
+        park([this, offset, in] { return write(offset, in); }, std::move(done));
+    }
+    auto submit_flush(blk::BackendCompletion done) -> void override {
+        park([] { return blk::BackendResult{}; }, std::move(done));
+    }
+    [[nodiscard]] auto poll() -> bool override {
+        auto ops = std::exchange(_ops, {});
+        for (auto& op : ops) {
+            if (op.released) {
+                // The buffers are still the function's: it holds the slot.
+                op.done(op.ok ? op.run() : std::unexpected(blk::BackendError::io));
+            } else {
+                _ops.push_back(std::move(op));
+            }
+        }
+        return !_ops.empty();
+    }
+    // Marks the operation at `index` (mod the parked count) to complete in
+    // the next poll(), with success or io.
+    auto release(std::size_t index, bool ok) -> void {
+        if (!_ops.empty()) {
+            auto& op = _ops[index % _ops.size()];
+            op.released = true;
+            op.ok = ok;
+        }
+    }
 
     [[nodiscard]] auto size_bytes() const noexcept -> std::uint64_t override {
         return _data.size();
@@ -81,6 +125,23 @@ public:
     [[nodiscard]] auto flush() -> std::expected<void, blk::BackendError> override { return {}; }
 
 private:
+    struct Op {
+        std::move_only_function<blk::BackendResult()> run;
+        blk::BackendCompletion done;
+        bool released{false};
+        bool ok{true};
+    };
+
+    auto park(std::move_only_function<blk::BackendResult()> run, blk::BackendCompletion done)
+        -> void {
+        if (!_async) {
+            done(run());
+            return;
+        }
+        _ops.push_back(
+            {.run = std::move(run), .done = std::move(done), .released = false, .ok = true});
+    }
+
     auto check(std::uint64_t offset, std::size_t len) const -> void {
         if (len == 0 || len % _block != 0 || offset % _block != 0 || offset > _data.size() ||
             len > _data.size() - offset || len > max_transfer) {
@@ -89,7 +150,9 @@ private:
     }
 
     std::uint32_t _block;
+    bool _async;
     std::vector<std::byte> _data;
+    std::vector<Op> _ops;
 };
 
 class Input {
@@ -156,17 +219,21 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     NullInterrupts irq;
     const std::uint32_t block = (mode & mode_4k) != 0 ? block_4k : blk::sector_size;
-    auto fn =
-        blk::VirtioBlkFunction::create({.geometry = {.capacity_sectors = capacity_sectors,
-                                                     .logical_block_size = block,
-                                                     .read_only = (mode & mode_read_only) != 0,
-                                                     .seg_max = seg_max,
-                                                     .max_transfer_bytes = max_transfer},
-                                        .num_queues = 1,
-                                        .queue_size = queue_size,
-                                        .budget = 4,
-                                        .serial = "fuzz"},
-                                       memory, irq, std::make_unique<CheckingBackend>(block));
+    const bool async = (mode & mode_async) != 0;
+    auto backend = std::make_unique<CheckingBackend>(block, async);
+    CheckingBackend& checking = *backend;
+    auto fn = blk::VirtioBlkFunction::create(
+        {.geometry = {.capacity_sectors = capacity_sectors,
+                      .logical_block_size = block,
+                      .read_only = (mode & mode_read_only) != 0,
+                      .seg_max = seg_max,
+                      .max_transfer_bytes = max_transfer},
+         .num_queues = 1,
+         .queue_size = queue_size,
+         .budget = 4,
+         .serial = "fuzz",
+         .max_in_flight = async ? async_in_flight : std::uint16_t{1}},
+        memory, irq, std::move(backend));
     if (!fn) {
         std::abort();
     }
@@ -185,7 +252,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 
     std::array<std::byte, blk::xts_key_size> key{};
     for (std::size_t op = 0; op < max_ops && !in.empty(); ++op) {
-        switch (in.u8() % 10) {
+        switch (in.u8() % 11) {
             case 0:
                 static_cast<void>(pci.bar_write(virtio::bar_layout::notify_offset, width16, 0));
                 break;
@@ -242,6 +309,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                     pci.memory_changing(ram_base + in.u16(), in.u16());
                 }
                 break;
+            case 9: {
+                // The backend finishes a parked operation, then the loop runs.
+                const std::uint8_t pick = in.u8();
+                checking.release(pick >> 1U, (pick & 1U) != 0);
+                static_cast<void>(dev.poll());
+                break;
+            }
             default: {
                 // The guest rewrites a byte of its own RAM mid-run.
                 const std::size_t at = in.u16() % ram_image_max;

@@ -173,7 +173,9 @@ public:
     // The transport is about to remove [gpa, gpa + len). Only a live ring
     // (descriptor table, available or used ring) inside that range forces
     // DEVICE_NEEDS_RESET. Buffers are translated afresh on every pop and no
-    // device keeps their spans between calls, so nothing else can dangle.
+    // device keeps their spans between calls, so nothing else can dangle:
+    // a device that completes a chain later keeps its guest addresses and
+    // translates them again (Chain::writable_gpa).
     // Hosts unmap ranges that never held rings all the time: the VMM drops
     // and re-adds the window of every BAR whose decoding the guest
     // toggles, and those windows are DMA regions too. Failing the device

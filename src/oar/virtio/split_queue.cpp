@@ -168,6 +168,7 @@ auto SplitQueue::add_buffer(Chain& chain, const Descriptor& d, bool& seen_writab
         }
         seen_writable = true;
         chain.writable.push_back(*buf);
+        chain.writable_gpa.push_back(d.addr);
         chain.writable_bytes += d.len;
     } else {
         if (seen_writable) {

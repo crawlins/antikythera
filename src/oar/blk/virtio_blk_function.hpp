@@ -21,7 +21,7 @@
 // queue. size_max is max_transfer_bytes / seg_max, so no request the driver
 // can build exceeds the transfer cap the parser enforces.
 //
-// Requests are served synchronously in queue_notified(), up to a budget per
+// Requests are taken from the rings in queue_notified(), up to a budget per
 // call; the rest wait for poll(). Each one goes through RequestParser
 // (bounds, shape, range) before any I/O, then:
 //
@@ -32,6 +32,23 @@
 //          copied out to the guest, and the bounce buffer is wiped;
 //   FLUSH  forwarded to the backend;
 //   GET_ID the attachment's serial, zero-padded to 20 bytes.
+//
+// IN, OUT and FLUSH go to the backend asynchronously (BlockBackend above).
+// Each queue has max_in_flight slots, each with its own bounce buffer; a
+// request holds a slot from submit to completion, and a queue whose slots
+// are all busy takes no more requests until one completes. Completions may
+// arrive in any order, and so may the used-ring entries (virtio allows it).
+// A parked request keeps its chain's writable guest addresses, not their
+// spans, and translates them again when it completes, because the
+// transport may remap guest memory meanwhile (PciFunction::memory_changing);
+// an address that no longer translates puts the function in
+// DEVICE_NEEDS_RESET, as a ring error does. A reset or FLR while requests
+// are in flight abandons them: their completions wipe their slots and touch
+// neither guest memory nor the new rings, and their bounce buffers are not
+// wiped under the backend's feet (a write in flight still lands whole, as
+// any unacknowledged write may). The function's poll() runs the backend's
+// completions and stays true while requests are in flight; wake_fd() lets
+// the role's event loop sleep until an asynchronous backend has some.
 //
 // The XTS data unit is the logical block (512 B or 4 KiB) and its tweak is
 // the logical block number, so sector s of a 4 KiB volume is in unit s / 8
@@ -66,10 +83,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "oar/blk/key_slot.hpp"
@@ -121,6 +140,18 @@ enum class BackendError : std::uint8_t {
 // Where one volume's ciphertext lives: a sparse file in harbor (oar-blk
 // task 5), an NVMe namespace on the board. Offsets are volume byte offsets
 // (512 * sector); any metadata header is the backend's own business.
+//
+// The interface is asynchronous (.kiro/specs/block-volume-service/ task 3,
+// oar-blk task 14): an operation is submitted with a completion, and the
+// completion runs exactly once, on the role thread, either inside the
+// submit call (a backend that finishes at once) or inside a later poll().
+// The buffer passed to a submit stays valid and untouched by the caller
+// until its completion has run. Destroying a backend drops the completions
+// still pending without running them, and the backend touches no buffer
+// after its destructor returns (it joins or detaches whatever it started).
+using BackendResult = std::expected<void, BackendError>;
+using BackendCompletion = std::move_only_function<void(BackendResult)>;
+
 class BlockBackend {
 public:
     BlockBackend() = default;
@@ -132,12 +163,44 @@ public:
 
     // Bytes of volume data the backend holds.
     [[nodiscard]] virtual auto size_bytes() const noexcept -> std::uint64_t = 0;
+    // Reads out.size() bytes at `offset` into `out`.
+    virtual auto submit_read(std::uint64_t offset, std::span<std::byte> out, BackendCompletion done)
+        -> void = 0;
+    // Writes `in` at `offset`.
+    virtual auto submit_write(std::uint64_t offset, std::span<const std::byte> in,
+                              BackendCompletion done) -> void = 0;
+    // Makes every write completed before this submit durable.
+    virtual auto submit_flush(BackendCompletion done) -> void = 0;
+    // Runs the completions that are ready; true while operations remain in
+    // flight. Synchronous backends have none.
+    [[nodiscard]] virtual auto poll() -> bool { return false; }
+    // A descriptor that becomes readable when poll() has completions to
+    // run, for the role's event loop; -1 when the backend never completes
+    // later than its submit.
+    [[nodiscard]] virtual auto wake_fd() const noexcept -> int { return -1; }
+};
+
+// A backend whose operations finish inside the call: the file backend, the
+// null backend and test doubles implement read, write and flush, and the
+// submits complete at once.
+class SyncBlockBackend : public BlockBackend {
+public:
     [[nodiscard]] virtual auto read(std::uint64_t offset, std::span<std::byte> out)
-        -> std::expected<void, BackendError> = 0;
+        -> BackendResult = 0;
     [[nodiscard]] virtual auto write(std::uint64_t offset, std::span<const std::byte> in)
-        -> std::expected<void, BackendError> = 0;
+        -> BackendResult = 0;
     // Makes every completed write durable.
-    [[nodiscard]] virtual auto flush() -> std::expected<void, BackendError> = 0;
+    [[nodiscard]] virtual auto flush() -> BackendResult = 0;
+
+    auto submit_read(std::uint64_t offset, std::span<std::byte> out, BackendCompletion done)
+        -> void override {
+        done(read(offset, out));
+    }
+    auto submit_write(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done)
+        -> void override {
+        done(write(offset, in));
+    }
+    auto submit_flush(BackendCompletion done) -> void override { done(flush()); }
 };
 
 struct BlkParams {
@@ -148,6 +211,9 @@ struct BlkParams {
     std::size_t budget{256};
     // VIRTIO_BLK_T_GET_ID answer; at most 20 bytes, zero-padded on the wire.
     std::string_view serial;
+    // Requests per queue in the backend at once (each holds a bounce buffer
+    // of max_transfer_bytes); 1 to queue_size.
+    std::uint16_t max_in_flight{1};
 };
 
 enum class BlkConfigError : std::uint8_t {
@@ -160,6 +226,7 @@ enum class BlkConfigError : std::uint8_t {
     backend_missing,    // no backend
     backend_too_small,  // backend holds less than capacity_sectors * 512 bytes
     key_slot,           // the KeySlot could not be created (mmap/mlock/madvise)
+    bad_in_flight,      // max_in_flight 0 or above queue_size
 };
 
 enum class KeyError : std::uint8_t {
@@ -178,6 +245,8 @@ struct BlkCounters {
     std::uint64_t no_key{0};           // IN/OUT refused because no key is held
     std::uint64_t queue_errors{0};     // DEVICE_NEEDS_RESET raised by this device
     std::uint64_t function_resets{0};  // FLRs
+    std::uint64_t parked{0};           // IN/OUT/FLUSH that completed after their submit returned
+    std::uint64_t abandoned{0};        // in flight across a reset; completed into nothing
 };
 
 class VirtioBlkFunction final : public virtio::Device {
@@ -220,6 +289,10 @@ public:
         return _parser.geometry();
     }
     [[nodiscard]] auto counters() const noexcept -> const BlkCounters& { return _counters; }
+    // Requests submitted to the backend and not yet completed.
+    [[nodiscard]] auto in_flight() const noexcept -> std::size_t { return _in_flight; }
+    // The backend's wake descriptor (BlockBackend::wake_fd), or -1.
+    [[nodiscard]] auto wake_fd() const noexcept -> int { return _backend->wake_fd(); }
 
     // virtio::Device
     [[nodiscard]] auto read_config(std::uint32_t offset, std::size_t width) const
@@ -231,29 +304,55 @@ public:
     auto queues_dropped() -> void override;
 
 private:
+    // One request in the backend, or a free place for one.
+    struct Slot {
+        std::vector<std::byte> bounce;  // max_transfer_bytes
+        bool busy{false};
+        bool abandoned{false};  // a reset happened while it was in flight
+        std::uint16_t head{0};
+        RequestType type{RequestType::in};
+        std::uint64_t unit{0};      // first XTS data unit (IN)
+        std::size_t data_bytes{0};  // IN: bytes to scatter before the status byte
+        std::vector<std::pair<virtio::Gpa, std::size_t>> writable;  // the chain's writable buffers
+    };
+
     struct Queue {
         std::optional<XtsCipher> cipher;
-        std::vector<std::byte> bounce;  // max_transfer_bytes
-        bool pending{false};            // budget ran out; poll() continues
+        std::vector<Slot> slots;  // max_in_flight
+        bool pending{false};      // budget ran out, or a slot came free; poll() continues
+        bool signal{false};       // used entries pushed since the last interrupt
     };
 
     VirtioBlkFunction(const BlkParams& params, RequestParser parser, KeySlot key,
-                      std::unique_ptr<BlockBackend> backend);
+                      const virtio::GuestMemory& memory, std::unique_ptr<BlockBackend> backend);
 
-    // Serves up to the budget; true if requests remain.
+    // Takes up to the budget; true if requests remain in the ring.
     auto process(std::uint16_t index) -> bool;
-    // Serves one chain and returns the bytes written into it, or nullopt if
-    // it cannot be completed (no status byte).
-    auto serve(Queue& q, const virtio::Chain& chain) -> std::optional<std::uint32_t>;
-    auto do_io(Queue& q, const Request& req) -> Status;
+    // Serves one chain. Returns false if the function had to fail.
+    auto serve(std::uint16_t index, const virtio::Chain& chain) -> bool;
+    // Hands an IN, OUT or FLUSH to the backend in a free slot.
+    auto submit(std::uint16_t index, std::size_t slot, const virtio::Chain& chain,
+                const Request& req) -> void;
+    // A backend completion for (queue, slot).
+    auto finish(std::uint16_t index, std::size_t slot, BackendResult result) -> void;
+    // Writes `data` then the status byte over a slot's writable buffers,
+    // translated again; false if they no longer translate.
+    auto deliver(const Slot& s, std::span<const std::byte> data, Status st) -> bool;
+    auto count(Status st) -> void;
     auto do_get_id(const Request& req) -> std::uint32_t;
     auto queue_error() -> void;
+    auto signal_queues() -> void;
+    auto abandon_in_flight() noexcept -> void;
+    // Wipes every bounce buffer the backend is not using.
     auto wipe_bounce() noexcept -> void;
 
     std::unique_ptr<virtio::PciFunction> _pci;
     RequestParser _parser;
     KeySlot _key;
+    const virtio::GuestMemory* _memory;
     std::unique_ptr<BlockBackend> _backend;
+    std::size_t _in_flight{0};
+    bool _in_submit{false};
     std::size_t _budget;
     std::vector<Queue> _queues;
     std::array<std::byte, blk_cfg::size> _device_config{};
