@@ -242,12 +242,17 @@ auto main(int argc, char** argv) -> int {
 
     bool more = false;
     for (;;) {
-        // [0] the sideband (or its listener), then one entry per function.
+        // [0] the sideband (or its listener), then one entry per function,
+        // then the backends' wake descriptors: a backend completing later
+        // than its submit wakes the loop, and poll() below runs it.
         std::vector<pollfd> fds(1 + transports.size());
         fds[0] = {
             .fd = sideband ? sideband->fd() : (*listener)->fd(), .events = POLLIN, .revents = 0};
         for (std::size_t i = 0; i < transports.size(); ++i) {
             fds[i + 1] = {.fd = transports[i]->binding().poll_fd(), .events = POLLIN, .revents = 0};
+        }
+        for (const int fd : (*role)->wake_fds()) {
+            fds.push_back({.fd = fd, .events = POLLIN, .revents = 0});
         }
         if (::poll(fds.data(), fds.size(), more ? poll_now : poll_forever) < 0) {
             if (errno == EINTR) {

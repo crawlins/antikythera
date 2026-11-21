@@ -119,6 +119,10 @@ public:
     // Serves deferred requests on every attached function; true if any
     // still has work (call again soon).
     auto poll() -> bool;
+    // The backends' wake descriptors (VirtioBlkFunction::wake_fd) of the
+    // attached functions, for the event loop to sleep on alongside the
+    // transports; call poll() when one is readable.
+    [[nodiscard]] auto wake_fds() const -> std::vector<int>;
 
     [[nodiscard]] auto volume_path(std::uint64_t volume_id) const -> std::filesystem::path;
     [[nodiscard]] auto function_count() const noexcept -> std::size_t { return _slots.size(); }

@@ -32,19 +32,34 @@
 // ended, or in the next chunk, doubles a window of chunks to prefetch, up
 // to max_readahead_chunks; any other read resets it.
 //
-// A miss blocks the caller until the fetcher has the chunk or gives up at
-// its deadline (Requirement 8.10): the role thread waits, which asynchronous
-// completion in VirtioBlkFunction removes later (oar-blk task 14).
+// read() is synchronous: a miss blocks the caller until the fetcher has
+// the chunk or gives up at its deadline (Requirement 8.10). submit_read()
+// is not (block-volume-service task 3, which subsumes oar-blk task 14): a
+// read whose image chunks are all resident or holes completes at once;
+// otherwise it parks, each missing chunk goes to Fetcher::fetch_async, and
+// the arrivals land in an inbox whose eventfd is wake_fd(). poll() takes
+// them on the role thread and completes each read once its last chunk is
+// in (or one failed, which fails the read with io). The fetched bytes are
+// used even if the cache had no room for them; a chunk that was resident
+// at submit and evicted before completion is fetched again synchronously.
+// The completion decrypts and re-encrypts with whatever keys are loaded
+// then: none fails the read, as after drop_keys(). Destroying the backend
+// drops parked reads without running their completions; fetches still in
+// flight post to the inbox, which they keep alive, and nobody reads it.
 //
-// Not thread-safe: the role thread owns it.
+// Not thread-safe: the role thread owns it (the inbox is the only state
+// another thread touches).
 
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "oar/blk/chunk_cache.hpp"
 #include "oar/blk/fetcher.hpp"
@@ -72,6 +87,7 @@ enum class LazyImageError : std::uint8_t {
     bad_block_size,  // not 512/4096, or does not fit the image
     bad_capacity,    // smaller than the image, or not whole blocks
     overlay,         // the overlay file could not be created
+    wake,            // the inbox's eventfd could not be created
 };
 
 enum class ImageKeyError : std::uint8_t {
@@ -90,13 +106,14 @@ struct LazyImageCounters {
     std::uint64_t zero_reads{0};     // blocks past the end of the image
     std::uint64_t cache_hits{0};     // chunk pieces found in the cache
     std::uint64_t fetches{0};        // demand fetches
+    std::uint64_t parked{0};         // reads that waited for fetch_async
     std::uint64_t fetch_failures{0};
     std::uint64_t readahead{0};  // chunks handed to prefetch
     std::uint64_t writes{0};
     std::uint64_t overlay_full{0};
 };
 
-class LazyImageBackend final : public BlockBackend {
+class LazyImageBackend final : public SyncBlockBackend {
 public:
     [[nodiscard]] static auto create(LazyImageParams params)
         -> std::expected<std::unique_ptr<LazyImageBackend>, LazyImageError>;
@@ -105,7 +122,7 @@ public:
     auto operator=(const LazyImageBackend&) -> LazyImageBackend& = delete;
     LazyImageBackend(LazyImageBackend&&) = delete;
     auto operator=(LazyImageBackend&&) -> LazyImageBackend& = delete;
-    ~LazyImageBackend() override = default;
+    ~LazyImageBackend() override;
 
     [[nodiscard]] auto load_keys(XtsKey ephemeral, std::optional<XtsKey> image_key)
         -> std::expected<void, ImageKeyError>;
@@ -126,6 +143,12 @@ public:
         -> std::expected<void, BackendError> override;
     // The overlay does not outlive the attachment: nothing to make durable.
     [[nodiscard]] auto flush() -> std::expected<void, BackendError> override { return {}; }
+    auto submit_read(std::uint64_t offset, std::span<std::byte> out, BackendCompletion done)
+        -> void override;
+    [[nodiscard]] auto poll() -> bool override;
+    [[nodiscard]] auto wake_fd() const noexcept -> int override { return _inbox->fd; }
+    // Reads waiting for fetches.
+    [[nodiscard]] auto parked() const noexcept -> std::size_t { return _reads.size(); }
 
 private:
     enum class Source : std::uint8_t {
@@ -134,14 +157,54 @@ private:
         zero,
     };
 
-    LazyImageBackend(LazyImageParams params, std::unique_ptr<Overlay> overlay) noexcept
-        : _params{std::move(params)}, _overlay{std::move(overlay)} {}
+    using Fetched = std::map<std::uint32_t, ChunkBytes>;
+
+    struct Arrival {
+        std::uint64_t read{0};
+        std::uint32_t chunk{0};
+        FetchResult result;
+    };
+    // Where fetcher workers leave arrivals for the role thread. Shared with
+    // the callbacks so a fetch finishing after the backend is gone is safe.
+    struct Inbox {
+        Inbox(const Inbox&) = delete;
+        auto operator=(const Inbox&) -> Inbox& = delete;
+        Inbox(Inbox&&) = delete;
+        auto operator=(Inbox&&) -> Inbox& = delete;
+        explicit Inbox(int event_fd) noexcept : fd{event_fd} {}
+        ~Inbox();
+        auto post(Arrival a) -> void;
+        [[nodiscard]] auto take() -> std::vector<Arrival>;
+
+        const int fd;
+        std::mutex mutex;
+        std::vector<Arrival> arrivals;
+    };
+    struct ParkedRead {
+        std::uint64_t offset{0};
+        std::span<std::byte> out;
+        BackendCompletion done;
+        std::size_t waiting{0};
+        bool failed{false};
+        Fetched chunks;
+    };
+
+    LazyImageBackend(LazyImageParams params, std::unique_ptr<Overlay> overlay,
+                     std::shared_ptr<Inbox> inbox) noexcept
+        : _params{std::move(params)}, _overlay{std::move(overlay)}, _inbox{std::move(inbox)} {}
 
     [[nodiscard]] auto source(std::uint64_t block) const noexcept -> Source;
     [[nodiscard]] auto check(std::uint64_t offset, std::size_t len) const noexcept -> bool;
+    // The checked range as ciphertext under K_eph, chunks in `fetched`
+    // taking the place of the cache.
+    [[nodiscard]] auto read_blocks(std::uint64_t offset, std::span<std::byte> out,
+                                   const Fetched* fetched) -> std::expected<void, BackendError>;
     // Image bytes [offset, offset + out.size()) as plaintext.
-    [[nodiscard]] auto read_image(std::uint64_t offset, std::span<std::byte> out)
-        -> std::expected<void, BackendError>;
+    [[nodiscard]] auto read_image(std::uint64_t offset, std::span<std::byte> out,
+                                  const Fetched* fetched) -> std::expected<void, BackendError>;
+    // The image chunks under [offset, end) a read would have to fetch.
+    [[nodiscard]] auto misses(std::uint64_t offset, std::uint64_t end) const
+        -> std::vector<std::uint32_t>;
     auto readahead(std::uint64_t offset, std::uint64_t end) -> void;
 
     LazyImageParams _params;
@@ -151,6 +214,9 @@ private:
     std::optional<std::uint64_t> _last_end;  // end of the previous read
     std::uint32_t _window{0};
     LazyImageCounters _counters;
+    std::shared_ptr<Inbox> _inbox;
+    std::map<std::uint64_t, ParkedRead> _reads;  // by id
+    std::uint64_t _next_read{1};
 };
 
 }  // namespace ak::oar::blk

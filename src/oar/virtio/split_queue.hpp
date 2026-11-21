@@ -95,11 +95,15 @@ enum class QueueError : std::uint8_t {
 [[nodiscard]] auto to_string(QueueError e) noexcept -> const char*;
 
 // One available buffer: the device reads `readable` in order, then writes
-// `writable` in order. The spans alias guest memory.
+// `writable` in order. The spans alias guest memory and are valid only until
+// the device returns to the transport; a device that completes a chain
+// later (VirtioBlkFunction with an asynchronous backend) keeps
+// `writable_gpa` instead and translates it again when it completes.
 struct Chain {
     std::uint16_t head{0};
     std::vector<std::span<const std::byte>> readable;
     std::vector<std::span<std::byte>> writable;
+    std::vector<Gpa> writable_gpa;  // where each `writable` segment starts
     std::uint64_t readable_bytes{0};
     std::uint64_t writable_bytes{0};
 };

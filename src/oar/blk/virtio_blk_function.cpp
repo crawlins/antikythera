@@ -53,16 +53,6 @@ auto gather(std::span<const std::span<const std::byte>> segments, std::span<std:
     }
 }
 
-// `in` copied out over `segments`, in order (same total size).
-auto scatter(std::span<const std::byte> in, std::span<const std::span<std::byte>> segments)
-    -> void {
-    std::size_t at = 0;
-    for (auto seg : segments) {
-        std::memcpy(seg.data(), in.data() + at, seg.size());
-        at += seg.size();
-    }
-}
-
 }  // namespace
 
 auto to_string(BackendError e) noexcept -> const char* {
@@ -93,6 +83,8 @@ auto to_string(BlkConfigError e) noexcept -> const char* {
             return "backend_too_small";
         case BlkConfigError::key_slot:
             return "key_slot";
+        case BlkConfigError::bad_in_flight:
+            return "bad_in_flight";
     }
     return "unknown";
 }
@@ -128,6 +120,9 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
     if (params.serial.size() > id_bytes) {
         return std::unexpected(BlkConfigError::serial_too_long);
     }
+    if (params.max_in_flight == 0 || params.max_in_flight > params.queue_size) {
+        return std::unexpected(BlkConfigError::bad_in_flight);
+    }
     if (!backend) {
         return std::unexpected(BlkConfigError::backend_missing);
     }
@@ -141,7 +136,7 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
     }
     // The constructor is private, so make_unique cannot reach it.
     std::unique_ptr<VirtioBlkFunction> fn{
-        new VirtioBlkFunction(params, *parser, std::move(*key), std::move(backend))};
+        new VirtioBlkFunction(params, *parser, std::move(*key), memory, std::move(backend))};
     auto pci = virtio::PciFunction::create(
         *fn, memory, interrupts,
         {.identity = {.device_id = static_cast<std::uint16_t>(virtio::pci_device_id_modern_base +
@@ -161,15 +156,20 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
 }
 
 VirtioBlkFunction::VirtioBlkFunction(const BlkParams& params, RequestParser parser, KeySlot key,
+                                     const virtio::GuestMemory& memory,
                                      std::unique_ptr<BlockBackend> backend)
     : _parser{parser},
       _key{std::move(key)},
+      _memory{&memory},
       _backend{std::move(backend)},
       _budget{params.budget},
       _queues(params.num_queues) {
     const VolumeGeometry& g = params.geometry;
     for (auto& q : _queues) {
-        q.bounce.resize(g.max_transfer_bytes);
+        q.slots.resize(params.max_in_flight);
+        for (auto& slot : q.slots) {
+            slot.bounce.resize(g.max_transfer_bytes);
+        }
     }
 
     // virtio_blk_config, little-endian. Geometry and topology stay zero:
@@ -191,6 +191,14 @@ VirtioBlkFunction::VirtioBlkFunction(const BlkParams& params, RequestParser pars
 }
 
 VirtioBlkFunction::~VirtioBlkFunction() {
+    // The backend first: destroying it drops its pending completions and
+    // ends its use of the bounce buffers, which can then all be wiped.
+    _backend.reset();
+    for (auto& q : _queues) {
+        for (auto& slot : q.slots) {
+            slot.busy = false;
+        }
+    }
     wipe_bounce();
 }
 
@@ -229,6 +237,8 @@ auto VirtioBlkFunction::queue_notified(std::uint16_t index) -> void {
 }
 
 auto VirtioBlkFunction::poll() -> bool {
+    // Completions first: they free slots that queued requests are waiting for.
+    const bool backend_busy = _backend->poll();
     bool more = false;
     for (std::size_t i = 0; i < _queues.size(); ++i) {
         if (_queues[i].pending) {
@@ -237,18 +247,46 @@ auto VirtioBlkFunction::poll() -> bool {
             more = more || _queues[i].pending;
         }
     }
-    return more;
+    signal_queues();
+    // In flight without a wake descriptor: only polling notices completions.
+    return more || ((backend_busy || _in_flight != 0) && _backend->wake_fd() < 0);
 }
 
 auto VirtioBlkFunction::queues_dropped() -> void {
     for (auto& q : _queues) {
         q.pending = false;
+        q.signal = false;
+    }
+    abandon_in_flight();
+}
+
+auto VirtioBlkFunction::abandon_in_flight() noexcept -> void {
+    for (auto& q : _queues) {
+        for (auto& slot : q.slots) {
+            if (slot.busy && !slot.abandoned) {
+                slot.abandoned = true;
+                ++_counters.abandoned;
+            }
+        }
     }
 }
 
 auto VirtioBlkFunction::wipe_bounce() noexcept -> void {
     for (auto& q : _queues) {
-        OPENSSL_cleanse(q.bounce.data(), q.bounce.size());
+        for (auto& slot : q.slots) {
+            if (!slot.busy) {
+                OPENSSL_cleanse(slot.bounce.data(), slot.bounce.size());
+            }
+        }
+    }
+}
+
+auto VirtioBlkFunction::signal_queues() -> void {
+    for (std::size_t i = 0; i < _queues.size(); ++i) {
+        if (_queues[i].signal) {
+            _queues[i].signal = false;
+            _pci->signal(static_cast<std::uint16_t>(i));
+        }
     }
 }
 
@@ -259,6 +297,7 @@ auto VirtioBlkFunction::queue_error() -> void {
 
 auto VirtioBlkFunction::function_reset() -> void {
     _pci->reset();
+    abandon_in_flight();
     // The VMM's open resets the function before helm sends the key, so an
     // FLR does not end the wait for it.
     const bool awaiting = _awaiting_key;
@@ -324,12 +363,21 @@ auto VirtioBlkFunction::process(std::uint16_t index) -> bool {
         return false;
     }
     Queue& q = _queues[index];
+    const auto free_slot = [&q] {
+        return std::ranges::any_of(q.slots, [](const Slot& s) { return !s.busy; });
+    };
     ring->set_notifications(false);
     for (std::size_t done = 0;; ++done) {
         if (done == _budget) {
             // Notifications stay off; the transport calls poll() for the rest.
             _pci->signal(index);
+            q.signal = false;
             return true;
+        }
+        if (!free_slot()) {
+            // Every slot is in the backend. Notifications stay off; the next
+            // completion marks the queue pending and poll() continues.
+            break;
         }
         auto next = ring->pop();
         if (next && !next->has_value()) {
@@ -346,54 +394,19 @@ auto VirtioBlkFunction::process(std::uint16_t index) -> bool {
             queue_error();
             return false;
         }
-        const virtio::Chain& chain = **next;
-        const auto written = serve(q, chain);
-        if (!written || !ring->push(chain.head, *written)) {
-            queue_error();
+        if (!serve(index, **next)) {
             return false;
+        }
+        if (_pci->queue(index) != ring) {
+            return false;  // an inline completion failed the function
         }
     }
     _pci->signal(index);
+    q.signal = false;
     return false;
 }
 
-auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain)
-    -> std::optional<std::uint32_t> {
-    auto parsed = _parser.parse(chain.readable, chain.writable);
-    std::uint32_t data_written = 0;
-    Status st = Status::ok;
-    std::span<std::byte> status_byte;
-    if (!parsed) {
-        const Rejection& r = parsed.error();
-        if (r.error == ParseError::no_status_byte) {
-            return std::nullopt;
-        }
-        st = status_for(r.error);
-        status_byte = r.status;
-    } else {
-        const Request& req = *parsed;
-        status_byte = req.status;
-        switch (req.type) {
-            case RequestType::in:
-            case RequestType::out:
-                st = do_io(q, req);
-                if (st == Status::ok && req.type == RequestType::in) {
-                    // data_bytes <= max_transfer_bytes <= max_bounce_bytes
-                    data_written = static_cast<std::uint32_t>(req.data_bytes);
-                }
-                break;
-            case RequestType::flush:
-                st = _backend->flush() ? Status::ok : Status::ioerr;
-                break;
-            case RequestType::get_id:
-                data_written = do_get_id(req);
-                break;
-            default:
-                st = Status::unsupp;  // the parser admits no other type
-                break;
-        }
-    }
-    complete(status_byte, st);
+auto VirtioBlkFunction::count(Status st) -> void {
     switch (st) {
         case Status::ok:
             ++_counters.completed;
@@ -405,37 +418,187 @@ auto VirtioBlkFunction::serve(Queue& q, const virtio::Chain& chain)
             ++_counters.failed_ioerr;
             break;
     }
-    // Bytes written into the chain: the data (IN, GET_ID) and the status.
-    return data_written + static_cast<std::uint32_t>(status_size);
 }
 
-auto VirtioBlkFunction::do_io(Queue& q, const Request& req) -> Status {
+auto VirtioBlkFunction::serve(std::uint16_t index, const virtio::Chain& chain) -> bool {
+    virtio::SplitQueue* ring = _pci->queue(index);
+    auto parsed = _parser.parse(chain.readable, chain.writable);
+    std::uint32_t data_written = 0;
+    Status st = Status::ok;
+    std::span<std::byte> status_byte;
+    if (!parsed) {
+        const Rejection& r = parsed.error();
+        if (r.error == ParseError::no_status_byte) {
+            queue_error();
+            return false;
+        }
+        st = status_for(r.error);
+        status_byte = r.status;
+    } else {
+        const Request& req = *parsed;
+        status_byte = req.status;
+        switch (req.type) {
+            case RequestType::in:
+            case RequestType::out:
+            case RequestType::flush: {
+                Queue& q = _queues[index];
+                const auto it =
+                    std::ranges::find_if(q.slots, [](const Slot& s) { return !s.busy; });
+                // process() only pops with a slot free.
+                submit(index, static_cast<std::size_t>(it - q.slots.begin()), chain, req);
+                return true;
+            }
+            case RequestType::get_id:
+                data_written = do_get_id(req);
+                break;
+            default:
+                st = Status::unsupp;  // the parser admits no other type
+                break;
+        }
+    }
+    complete(status_byte, st);
+    count(st);
+    // Bytes written into the chain: the data (GET_ID) and the status.
+    if (!ring->push(chain.head, data_written + static_cast<std::uint32_t>(status_size))) {
+        queue_error();
+        return false;
+    }
+    _queues[index].signal = true;
+    return true;
+}
+
+auto VirtioBlkFunction::submit(std::uint16_t index, std::size_t slot, const virtio::Chain& chain,
+                               const Request& req) -> void {
+    Queue& q = _queues[index];
+    Slot& s = q.slots[slot];
+    s.busy = true;
+    s.abandoned = false;
+    s.head = chain.head;
+    s.type = req.type;
+    s.unit = req.sector / (_parser.geometry().logical_block_size / sector_size);
+    s.data_bytes = req.type == RequestType::in ? req.data_bytes : 0;
+    s.writable.clear();
+    for (std::size_t i = 0; i < chain.writable.size(); ++i) {
+        s.writable.emplace_back(chain.writable_gpa[i], chain.writable[i].size());
+    }
+    ++_in_flight;
+
+    // A completion that runs while _in_submit is set came back inside the
+    // submit call; any other was parked. Completions of other requests only
+    // run from the backend's poll(), never inside a submit.
+    auto done = [this, index, slot](BackendResult r) {
+        if (!_in_submit) {
+            ++_counters.parked;
+        }
+        finish(index, slot, r);
+    };
+    struct InSubmit {
+        bool& flag;
+        explicit InSubmit(bool& f) : flag{f} { flag = true; }
+        InSubmit(const InSubmit&) = delete;
+        auto operator=(const InSubmit&) -> InSubmit& = delete;
+        InSubmit(InSubmit&&) = delete;
+        auto operator=(InSubmit&&) -> InSubmit& = delete;
+        ~InSubmit() { flag = false; }
+    } const in_submit{_in_submit};
+
+    if (req.type == RequestType::flush) {
+        _backend->submit_flush(std::move(done));
+        return;
+    }
     if (!q.cipher) {
         ++_counters.no_key;
-        return Status::ioerr;  // no key: the volume cannot be read or written
+        finish(index, slot, std::unexpected(BackendError::io));  // no key: no volume data
+        return;
     }
     const std::uint64_t offset = req.sector * sector_size;
-    const std::uint64_t unit = req.sector / (_parser.geometry().logical_block_size / sector_size);
-    const std::span<std::byte> buf = std::span{q.bounce}.first(req.data_bytes);
-
+    const std::span<std::byte> buf = std::span{s.bounce}.first(req.data_bytes);
     if (req.type == RequestType::out) {
         // Copy once, so the guest cannot change the data between encrypting
         // and writing; the buffer holds ciphertext from here on.
         gather(req.out_data, buf);
-        if (!q.cipher->encrypt(unit, buf, buf)) {
-            OPENSSL_cleanse(buf.data(), buf.size());
-            return Status::ioerr;
+        if (!q.cipher->encrypt(s.unit, buf, buf)) {
+            finish(index, slot, std::unexpected(BackendError::io));
+            return;
         }
-        return _backend->write(offset, buf) ? Status::ok : Status::ioerr;
+        _backend->submit_write(offset, buf, std::move(done));
+    } else {
+        _backend->submit_read(offset, buf, std::move(done));
     }
+}
 
-    Status st = Status::ioerr;
-    if (_backend->read(offset, buf) && q.cipher->decrypt(unit, buf, buf)) {
-        scatter(buf, req.in_data);
-        st = Status::ok;
+auto VirtioBlkFunction::deliver(const Slot& s, std::span<const std::byte> data, Status st) -> bool {
+    // Translate every writable buffer again first, so nothing is written
+    // unless all of it can be.
+    std::vector<std::span<std::byte>> spans;
+    spans.reserve(s.writable.size());
+    for (const auto& [gpa, len] : s.writable) {
+        auto b = _memory->writable(gpa, len);
+        if (!b) {
+            return false;
+        }
+        spans.push_back(*b);
     }
-    OPENSSL_cleanse(buf.data(), buf.size());  // no plaintext left behind
-    return st;
+    // The parser checked that the buffers hold data_bytes plus the status
+    // byte. Without `data` (a failure) the data bytes are left alone.
+    const std::size_t total = s.data_bytes + status_size;
+    std::size_t at = 0;
+    for (auto seg : spans) {
+        for (auto& b : seg) {
+            if (at < s.data_bytes) {
+                if (!data.empty()) {
+                    b = data[at];
+                }
+            } else if (at + 1 == total) {
+                complete(std::span{&b, 1}, st);
+            }
+            ++at;
+        }
+    }
+    return true;
+}
+
+auto VirtioBlkFunction::finish(std::uint16_t index, std::size_t slot, BackendResult result)
+    -> void {
+    Queue& q = _queues[index];
+    Slot& s = q.slots[slot];
+    --_in_flight;
+    const auto release = [&s] {
+        OPENSSL_cleanse(s.bounce.data(), s.bounce.size());
+        s.busy = false;
+        s.abandoned = false;
+    };
+    if (s.abandoned) {
+        release();
+        return;
+    }
+    q.pending = true;  // a slot is free: requests may be waiting for it
+
+    Status st = result ? Status::ok : Status::ioerr;
+    const std::span<std::byte> buf = std::span{s.bounce}.first(s.data_bytes);
+    if (st == Status::ok && s.type == RequestType::in) {
+        // The key may have been dropped while the read was in flight.
+        if (!q.cipher || !q.cipher->decrypt(s.unit, buf, buf)) {
+            st = Status::ioerr;
+        }
+    }
+    // A failure owes the driver only its status byte.
+    const bool delivered = deliver(
+        s, st == Status::ok ? std::span<const std::byte>{buf} : std::span<const std::byte>{}, st);
+    release();  // no plaintext left behind
+    virtio::SplitQueue* ring = _pci->queue(index);
+    if (!delivered || ring == nullptr) {
+        queue_error();
+        return;
+    }
+    count(st);
+    const auto written =
+        static_cast<std::uint32_t>((st == Status::ok ? s.data_bytes : 0) + status_size);
+    if (!ring->push(s.head, written)) {
+        queue_error();
+        return;
+    }
+    q.signal = true;
 }
 
 auto VirtioBlkFunction::do_get_id(const Request& req) -> std::uint32_t {

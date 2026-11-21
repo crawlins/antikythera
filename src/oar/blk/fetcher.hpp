@@ -12,6 +12,11 @@
 //               (or failed) and returns its bytes, which the caller can use
 //               even if the cache had no room for them. Demand fetches go
 //               ahead of readahead.
+//   fetch_async()  a demand fetch that does not wait: `done` runs once with
+//               the result, on a worker thread when the chunk arrives (or
+//               on the caller's thread when it fails at once), never under
+//               the fetcher's lock. The caller hands the result to its own
+//               thread (LazyImageBackend's inbox).
 //   prefetch()  readahead: queued behind demand fetches, dropped when the
 //               queue is full or the chunk is already resident or coming.
 //
@@ -29,6 +34,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -61,6 +67,8 @@ struct FetcherCounters {
 };
 
 using ChunkBytes = std::shared_ptr<const std::vector<std::byte>>;
+using FetchResult = std::expected<ChunkBytes, FetchError>;
+using FetchCallback = std::move_only_function<void(FetchResult)>;
 
 class Fetcher {
 public:
@@ -78,6 +86,8 @@ public:
 
     [[nodiscard]] auto fetch(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk)
         -> std::expected<ChunkBytes, FetchError>;
+    auto fetch_async(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk,
+                     FetchCallback done) -> void;
     auto prefetch(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk) -> void;
 
     // Waits until nothing is queued or in flight (tests).
@@ -92,6 +102,7 @@ private:
         bool started{false};
         bool done{false};
         std::expected<ChunkBytes, FetchError> result{std::unexpected(FetchError::shut_down)};
+        std::vector<FetchCallback> callbacks;  // fetch_async waiters
     };
     using Key = std::pair<const CachedImage*, std::uint32_t>;
 
@@ -99,8 +110,15 @@ private:
 
     auto run() -> void;
     [[nodiscard]] auto download(const Job& job) -> std::expected<ChunkBytes, FetchError>;
-    auto finish(const std::shared_ptr<Job>& job, std::expected<ChunkBytes, FetchError> result)
-        -> void;  // caller holds _mutex
+    // Queues a demand for the chunk, or joins the job already queued or in
+    // flight; caller holds _mutex.
+    [[nodiscard]] auto demand(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk)
+        -> std::shared_ptr<Job>;
+    // Caller holds _mutex; returns the job's fetch_async callbacks, for the
+    // caller to run with the result once it has released the lock.
+    [[nodiscard]] auto finish(const std::shared_ptr<Job>& job,
+                              std::expected<ChunkBytes, FetchError> result)
+        -> std::vector<FetchCallback>;
 
     ObjectStore* _store;
     FetcherConfig _config;

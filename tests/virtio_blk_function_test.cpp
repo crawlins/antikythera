@@ -98,7 +98,7 @@ auto pattern(std::uint64_t first_sector, std::size_t bytes) -> std::vector<std::
     return out;
 }
 
-class MemoryBackend final : public blk::BlockBackend {
+class MemoryBackend final : public blk::SyncBlockBackend {
 public:
     explicit MemoryBackend(std::size_t bytes) : data(bytes, std::byte{0}) {}
 

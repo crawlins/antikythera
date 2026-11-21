@@ -3,7 +3,11 @@
 
 #include "oar/blk/lazy_image_backend.hpp"
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <utility>
 
 namespace ak::oar::blk {
 
@@ -17,6 +21,8 @@ auto to_string(LazyImageError e) noexcept -> const char* {
             return "bad_capacity";
         case LazyImageError::overlay:
             return "overlay";
+        case LazyImageError::wake:
+            return "wake";
     }
     return "unknown";
 }
@@ -54,8 +60,35 @@ auto LazyImageBackend::create(LazyImageParams params)
     if (!overlay) {
         return std::unexpected(LazyImageError::overlay);
     }
+    const int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) {
+        return std::unexpected(LazyImageError::wake);
+    }
     return std::unique_ptr<LazyImageBackend>(
-        new LazyImageBackend(std::move(params), std::move(*overlay)));
+        new LazyImageBackend(std::move(params), std::move(*overlay), std::make_shared<Inbox>(fd)));
+}
+
+LazyImageBackend::~LazyImageBackend() = default;
+
+LazyImageBackend::Inbox::~Inbox() {
+    ::close(fd);
+}
+
+auto LazyImageBackend::Inbox::post(Arrival a) -> void {
+    {
+        const std::scoped_lock lock{mutex};
+        arrivals.push_back(std::move(a));
+    }
+    const std::uint64_t one = 1;
+    // EAGAIN only when the counter is saturated, which still wakes.
+    [[maybe_unused]] const auto n = ::write(fd, &one, sizeof one);
+}
+
+auto LazyImageBackend::Inbox::take() -> std::vector<Arrival> {
+    std::uint64_t count = 0;
+    [[maybe_unused]] const auto n = ::read(fd, &count, sizeof count);  // EAGAIN: none
+    const std::scoped_lock lock{mutex};
+    return std::exchange(arrivals, {});
 }
 
 auto LazyImageBackend::load_keys(XtsKey ephemeral, std::optional<XtsKey> image_key)
@@ -116,6 +149,98 @@ auto LazyImageBackend::read(std::uint64_t offset, std::span<std::byte> out)
     if (!_eph) {
         return std::unexpected(BackendError::io);
     }
+    if (auto r = read_blocks(offset, out, nullptr); !r) {
+        return r;
+    }
+    readahead(offset, offset + out.size());
+    return {};
+}
+
+auto LazyImageBackend::submit_read(std::uint64_t offset, std::span<std::byte> out,
+                                   BackendCompletion done) -> void {
+    if (!check(offset, out.size())) {
+        done(std::unexpected(BackendError::out_of_range));
+        return;
+    }
+    if (!_eph) {
+        done(std::unexpected(BackendError::io));
+        return;
+    }
+    const auto missing = misses(offset, offset + out.size());
+    if (missing.empty()) {
+        auto r = read_blocks(offset, out, nullptr);
+        readahead(offset, offset + out.size());
+        done(r);
+        return;
+    }
+    const std::uint64_t id = _next_read++;
+    _reads.emplace(id, ParkedRead{.offset = offset,
+                                  .out = out,
+                                  .done = std::move(done),
+                                  .waiting = missing.size(),
+                                  .failed = false,
+                                  .chunks = {}});
+    ++_counters.parked;
+    for (const std::uint32_t chunk : missing) {
+        ++_counters.fetches;
+        // May run at once on this thread (a failure); the inbox takes it
+        // either way, and poll() completes the read.
+        _params.fetcher->fetch_async(
+            _params.image, chunk, [inbox = _inbox, id, chunk](FetchResult r) {
+                inbox->post({.read = id, .chunk = chunk, .result = std::move(r)});
+            });
+    }
+    readahead(offset, offset + out.size());
+}
+
+auto LazyImageBackend::poll() -> bool {
+    for (auto& a : _inbox->take()) {
+        const auto it = _reads.find(a.read);
+        if (it == _reads.end()) {
+            continue;
+        }
+        ParkedRead& p = it->second;
+        if (a.result) {
+            p.chunks.emplace(a.chunk, std::move(*a.result));
+        } else {
+            ++_counters.fetch_failures;
+            p.failed = true;
+        }
+        if (--p.waiting > 0) {
+            continue;
+        }
+        // Detach before completing: the completion may submit again.
+        auto node = _reads.extract(it);
+        ParkedRead& r = node.mapped();
+        BackendResult result = std::unexpected(BackendError::io);
+        if (!r.failed && _eph) {
+            result = read_blocks(r.offset, r.out, &r.chunks);
+        }
+        r.done(result);
+    }
+    return !_reads.empty();
+}
+
+auto LazyImageBackend::misses(std::uint64_t offset, std::uint64_t end) const
+    -> std::vector<std::uint32_t> {
+    const ImageManifest& m = _params.image->manifest();
+    const std::uint32_t lbs = _params.logical_block_size;
+    std::vector<std::uint32_t> out;
+    for (std::uint64_t at = offset; at < end; at += lbs) {
+        if (source(at / lbs) != Source::image) {
+            continue;
+        }
+        const auto chunk = static_cast<std::uint32_t>(at >> m.chunk_shift);
+        if ((out.empty() || out.back() != chunk) && !m.is_hole(chunk) &&
+            !_params.image->resident(chunk)) {
+            out.push_back(chunk);
+        }
+    }
+    return out;
+}
+
+auto LazyImageBackend::read_blocks(std::uint64_t offset, std::span<std::byte> out,
+                                   const Fetched* fetched) -> std::expected<void, BackendError> {
     const std::uint32_t lbs = _params.logical_block_size;
     std::size_t pos = 0;
     while (pos < out.size()) {
@@ -135,7 +260,7 @@ auto LazyImageBackend::read(std::uint64_t offset, std::span<std::byte> out)
                 _counters.overlay_reads += blocks;
                 break;
             case Source::image:
-                if (auto r = read_image(offset + pos, run); !r) {
+                if (auto r = read_image(offset + pos, run, fetched); !r) {
                     return r;
                 }
                 _counters.image_reads += blocks;
@@ -150,7 +275,6 @@ auto LazyImageBackend::read(std::uint64_t offset, std::span<std::byte> out)
         }
         pos += len;
     }
-    readahead(offset, offset + out.size());
     return {};
 }
 
@@ -173,8 +297,8 @@ auto LazyImageBackend::write(std::uint64_t offset, std::span<const std::byte> in
     return {};
 }
 
-auto LazyImageBackend::read_image(std::uint64_t offset, std::span<std::byte> out)
-    -> std::expected<void, BackendError> {
+auto LazyImageBackend::read_image(std::uint64_t offset, std::span<std::byte> out,
+                                  const Fetched* fetched) -> std::expected<void, BackendError> {
     const ImageManifest& m = _params.image->manifest();
     std::size_t pos = 0;
     while (pos < out.size()) {
@@ -187,7 +311,11 @@ auto LazyImageBackend::read_image(std::uint64_t offset, std::span<std::byte> out
         if (m.is_hole(chunk)) {
             std::ranges::fill(piece, std::byte{0});  // plaintext zeros, even when encrypted
         } else {
-            if (_params.image->read(chunk, within, piece)) {
+            const auto got = fetched != nullptr ? fetched->find(chunk) : Fetched::const_iterator{};
+            if (fetched != nullptr && got != fetched->end()) {
+                std::copy_n(got->second->begin() + static_cast<std::ptrdiff_t>(within), n,
+                            piece.begin());
+            } else if (_params.image->read(chunk, within, piece)) {
                 ++_counters.cache_hits;
             } else {
                 ++_counters.fetches;

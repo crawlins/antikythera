@@ -22,7 +22,7 @@ constexpr std::string_view placeholder_serial = "akv-none";
 
 // Every access fails: the placeholder never holds a key, so its requests
 // never get this far, and if one did it would still reach nothing.
-class NullBackend final : public BlockBackend {
+class NullBackend final : public SyncBlockBackend {
 public:
     [[nodiscard]] auto size_bytes() const noexcept -> std::uint64_t override {
         return placeholder_bytes;
@@ -255,10 +255,22 @@ auto BlkRole::poll() -> bool {
     bool more = false;
     for (auto& s : _slots) {
         if (s.active) {
-            more = s.active->pci().poll() || more;
+            // The function itself, not pci().poll(): completions of requests
+            // abandoned by a reset must run even while the driver is not live.
+            more = s.active->poll() || more;
         }
     }
     return more;
+}
+
+auto BlkRole::wake_fds() const -> std::vector<int> {
+    std::vector<int> fds;
+    for (const auto& s : _slots) {
+        if (s.active && s.active->wake_fd() >= 0) {
+            fds.push_back(s.active->wake_fd());
+        }
+    }
+    return fds;
 }
 
 // ---- volumes ---------------------------------------------------------------
