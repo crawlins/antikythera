@@ -358,12 +358,12 @@ no storage server ever sees, and destroyed when I delete the volume.
 5. Creating a volume from a snapshot with a different `KmsKeyId` SHALL
    start a new lineage with a new data key (a keyed copy).
 
-### Requirement 13: Storage network and hold isolation
+### Requirement 13: Storage traffic on the management fabric, and hold isolation
 
 #### Acceptance Criteria
 
-1. Initiators and hold roles SHALL talk over a storage network separate
-   from tenant VPC traffic, authenticated and encrypted in transit with
+1. Initiators and hold roles SHALL talk over the management fabric, never
+   the tenant VPC fabric, authenticated and encrypted in transit with
    per-role identities issued at enrollment.
 2. A hold role SHALL accept a data-path session for a volume only from a
    member of the volume's replica set or from a server holding a current
@@ -373,6 +373,13 @@ no storage server ever sees, and destroyed when I delete the volume.
 4. Every parser of storage-network traffic, ReplicaConfig and volume
    operation frames SHALL return `std::expected`, use `ak::wire`, and have
    unit tests and a fuzz target.
+5. Storage traffic SHALL be kept on its own segment of the management
+   fabric, apart from helm's controller link, so that a data-plane role
+   cannot reach the controller or another server's helm.
+6. Storage traffic SHALL NOT be able to starve control traffic: the
+   controller link and lease traffic SHALL have priority over storage
+   I/O on the fabric, and storage I/O SHALL have priority over rebuild,
+   hydration and scrub.
 
 ### Requirement 14: EC2 API mapping
 

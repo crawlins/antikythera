@@ -83,13 +83,16 @@ repository. Prerequisites outside this spec: oar-blk task 14
   forced detach after fencing; hull Requirement 7.2 amendment; the
   `guest/ak-guest-eject` helper with a udev rule and shellcheck.
   _Requirements: 3.3-3.6_ (cloud)
-- [ ] 14. controller-interface spec update: EC2 mapping of
+- [ ] 14. controller-interface and backplane spec updates: a
+  management-fabric port on storage-capable data-plane slots, the storage
+  VLAN and traffic classes (backplane), and EC2 mapping of
   Requirement 14 (`CreateVolume` types, `ModifyVolume`, snapshots,
   `CopyVolumes`, `EnableFastSnapshotRestores`, `EnableVolumeIO`, status
   checks, `busy`), replacing controller Requirement 6.2's server-local
-  rule for network volumes. _Requirements: 14_ (cloud, docs)
+  rule for network volumes. _Requirements: 13.5-13.6, 14_ (cloud, docs)
 - [ ] 15. harbor: storage topology (two compute, three storage servers,
-  storage bridge), `ak-volctl` test controller on `ak_hold_master`; boot
+  storage VLAN on the management bridge, refused from helm
+  addresses), `ak-volctl` test controller on `ak_hold_master`; boot
   a VM from a network volume, hot-plug several volumes into one VM, a
   mounted volume's detach stays `busy`, forced detach is fenced, stop and
   start on the other compute server. _Requirements: 2, 3, 9, 15.3_

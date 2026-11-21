@@ -64,13 +64,51 @@ maps it onto pieces antikythera already has:
   server can be compute only, storage only, or both; placement treats
   them alike but never relies on co-location.
 - **oar-blk** gains an initiator backend; it needs a route to the storage
-  network. This closes oar-blk design's open question the same way for
-  object storage: each oar-blk board gets a storage-network port separate
-  from the VPC fabric (harbor: a veth into a storage bridge namespace).
+  network, which is the management fabric (see "Storage traffic on the
+  management fabric"). This also answers oar-blk design's open question
+  of how a storage board reaches the object store: over the same segment.
 - The **controller** owns all volume state (Requirement 6.1). helm
   forwards its frames to the roles and its roles' reports back, as it does
   for oar-net's `MapUpdate`. None of this goes through the mailbox except
   attach and detach, which change the VM.
+
+## Storage traffic on the management fabric
+
+The storage network is the management fabric: the Ethernet that already
+carries helm's controller link (backplane Requirement 3.2, controller
+Requirement 2.1). There is no separate storage fabric and no storage
+traffic on the tenant VPC fabric.
+
+- **Ports.** Every oar-blk and hold board gets a management-fabric port
+  (a backplane amendment for storage-capable data-plane slots), separate
+  from helm's own management port. The object store is reached the same
+  way.
+- **Segmentation.** Data-plane roles are untrusted, while helm's
+  controller link is the server's most trusted network path, so the two
+  never share a segment: storage traffic runs on a storage VLAN (and
+  address range) of its own, and the top-of-rack switches refuse traffic
+  from it to helm and controller addresses. A compromised board can reach
+  other storage roles, which authenticate every session (Requirement
+  13.2) and see only ciphertext, but not the control plane
+  (Requirement 13.5).
+- **Priority.** The fabric marks three classes, with strict priority for
+  the first and weighted sharing below it: control (controller link,
+  lease renewals and reports through helm), storage I/O (initiator to
+  primary, replication), and background (rebuild, resync, hydration,
+  scrub, snapshot upload). hold and oar-blk set DSCP/802.1p on their
+  sockets; helm marks its own. Leases ride the control class, so a
+  saturated storage segment cannot cost a healthy primary its lease
+  (Requirement 13.6).
+- **Sizing.** Every guest write crosses the fabric once to the primary
+  and once more per secondary, so a server's management uplink must be
+  sized for storage, not just for control: on the busiest link, about
+  `replicas` × write bandwidth plus reads, plus the rebuild budget. The rebuild budget in
+  "Resync and rebuild" is a fraction of the storage class's share, not of
+  the whole link. The 1 TiB-per-hour rebuild target (Requirement 7.6)
+  needs about 300 MB/s of background capacity, so a 25 GbE management
+  uplink is the practical floor for storage servers.
+- **harbor.** The storage segment is a VLAN on harbor's management
+  bridge, with the per-server namespaces of harbor task 7.
 
 ## Protocols
 
@@ -154,7 +192,8 @@ TCP with TLS 1.3 (`src/tls`), mutually authenticated with per-role
 certificates the controller's CA issues at enrollment (the role creates
 its key; helm relays the CSR). The certificate binds the `server_id`,
 which is what a hold role checks against the ReplicaConfig
-(Requirement 13.2). A session is opened per (volume, peer) with `HELLO`
+(Requirement 13.2); its packets carry the storage I/O class, or the
+background class for rebuild, hydration and scrub sessions. A session is opened per (volume, peer) with `HELLO`
 naming the volume, epoch, and either the attachment and its generation
 (initiator) or the member's `replica_gen` (peer).
 
@@ -680,8 +719,6 @@ C ABI) rather than re-deriving the rules from prose.
 
 - The vendor ID for the virtio vendor capability (antikythera has no PCI
   vendor ID; harbor can use a placeholder).
-- Whether the storage network is a separate physical fabric or a VLAN of
-  the server's uplink on the first hardware.
 - hold on a storage board vs a storage manager VM for dense servers
   (board throughput, about Gen3 x2, limits the former).
 - How tenant `KmsKeyId` protects the per-lineage key (kythira KMS spec).
