@@ -93,6 +93,7 @@ ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::pro
 ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)
 ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::proto)
 ak_add_test(proto_volume_test     SOURCES proto_volume_test.cpp     LIBS ak::proto)
+ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hold_master)
 ak_add_test(proto_group_policy_test SOURCES proto_group_policy_test.cpp LIBS ak::proto ak::helm ak::hull)
 ak_add_test(group_usage_test SOURCES group_usage_test.cpp LIBS ak::helm)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)

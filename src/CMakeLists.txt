@@ -114,6 +114,16 @@ target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
+# The controller's volume state machine (.kiro/specs/block-volume-service/
+# task 4): placement, epochs, leases, failover, rebuild, moves, snapshots
+# and GC over an abstract transport. The simulation and harbor drive it;
+# kythira's EC2 module ports it.
+add_library(ak_hold_master hold/master/master.cpp)
+add_library(ak::hold_master ALIAS ak_hold_master)
+target_link_libraries(ak_hold_master
+  PUBLIC ak::proto
+  PRIVATE ak::warnings ak::hardening)
+
 # harbor's test controller: signs commands and mapping updates and drives
 # one helm over the ControllerLink, standing in for kythira's EC2 module
 # until it exists (.kiro/specs/controller-interface/ task 5).
